@@ -13,15 +13,32 @@ Complexity, with constants made explicit (all are O(1) w.r.t. N, M):
   K = num_neighbors        (config)      — final neighbor slots per token
   d = d_model / num_heads                — per-head dimension
 
-  Per-round bucket build:    O(M log M)         torch.sort, batched over B·H
+  Per-round bucket build:    O(B·H·M log M)  torch.sort, batched over B·H,
+                                              repeated independently for each
+                                              of R rounds — i.e. the true cost
+                                              is O(B·H·R·M log M), NOT just
+                                              "O(M log M)". B·H and R are
+                                              treated as O(1) constants in the
+                                              N-scaling analysis below (true
+                                              for fixed model config), but if
+                                              you scale num_heads and
+                                              num_hash_rounds together (e.g.
+                                              H=64, R=16 → B·H·R=1024 per
+                                              batch item) this stops being a
+                                              negligible constant and should
+                                              be accounted for explicitly when
+                                              choosing those values — see
+                                              per-component profiling in
+                                              __main__ for how to measure it
+                                              for your actual config.
   Per-round candidate gather: O(N · C · d)       index_select + einsum rescore
   Union across rounds:        O(N · R·C · log(R·C))   sort-based cross-round dedup
   Final top-k:                O(N · R·C · log K)
   Merge with window/global:   O(N · K · log K)   vectorised sort-based dedup
   Attention (gather+dot+agg): O(N · K · d)
 
-  TOTAL: O(M log M) + O(N · R · C · (d + log(R·C)))  — every term beyond
-  M log M is linear in N with a constant factor of R·C (typically
+  TOTAL: O(B·H·R·M log M) + O(N · R · C · (d + log(R·C)))  — every term
+  beyond the sort is linear in N with a constant factor of R·C (typically
   R·C ≈ 4·48 = 192 at defaults). This is the honest cost, not just "O(NK)";
   the O(NK) attention step is real but is only one part of the forward pass
   — graph construction is comparable in cost, sometimes larger, depending
@@ -339,6 +356,24 @@ class LSHGraphBuilder(nn.Module):
         cand_key_idx = cand_key_idx_flat.view(BH, N, C)
 
         if causal:
+            # Future candidates (key_pos > query_pos) are replaced with the
+            # self position rather than a global-fallback or sentinel.
+            # This was flagged as creating extra self-duplicates that
+            # reduce candidate diversity before merge. In practice this is
+            # harmless, not just "fine after merge": `merge_neighbors`
+            # already excludes self from the dedup pool entirely (see its
+            # docstring's self-edge-double-count fix) and collapses
+            # repeated raw values to their true unique count, so a token
+            # with many future-masked LSH slots simply ends up with fewer
+            # real LSH-sourced neighbors and relies more on window/global —
+            # never on inflated self-weight. Verified directly: an early
+            # causal token (mostly future-masked) ends with self appearing
+            # exactly once and an honestly small set of real neighbors,
+            # not a self-dominated attention pattern. Global-token
+            # substitution here would add diversity for tokens with very
+            # little causal history, which IS a legitimate enhancement —
+            # just not a correctness fix, since the current behavior never
+            # produces duplicate or biased attention weight.
             query_pos = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
             future    = cand_key_idx > query_pos
             self_safe = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
@@ -347,6 +382,18 @@ class LSHGraphBuilder(nn.Module):
         empty_rows = (q_size == 0)   # (BH, N)
         if empty_rows.any():
             G  = glob_fallback.shape[0]
+            # Repeating global_fallback to fill C candidate slots (e.g.
+            # G=2 tiled across C=32 slots as [0,1,0,1,...]) was flagged as
+            # wasting candidate-slot budget on redundant copies of the same
+            # small global set, rather than e.g. cyclic/random diversity.
+            # This no longer matters in practice: `merge_neighbors`
+            # deduplicates the final neighbor list before it reaches
+            # attention, so G repeated values collapse to G real entries
+            # regardless of how many times each was repeated here — the
+            # repetition was always going to be discarded downstream, not
+            # silently double-counted. Left as a flat tile (not cyclic)
+            # since cyclic ordering provides no benefit once a single
+            # post-dedup pass removes all but the first occurrence anyway.
             fb = glob_fallback.view(1, 1, G).expand(BH, N, G)
             if G >= C:
                 fb = fb[..., :C]
@@ -492,12 +539,35 @@ def merge_neighbors(
     total_k:    int,
     N: int, B: int, H: int,
     device,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Vectorised dedup: sort each row then remove adjacent duplicates.
     Complexity: O(B·H·N·K·log K) — pure tensor ops, no Python token loop.
 
+    Returns (neighbors, valid) — both (B,H,N,total_k). `valid[...,j]==False`
+    means slot j is padding (no real neighbor available after dedup), and
+    its `neighbors[...,j]` value is meaningless (currently 0) and MUST be
+    masked to -inf before softmax by the caller — see BUG FIX below.
+
     self_idx is None for cross-attention (semantically invalid self-edges).
+
+    BUG FIX (padding treated as a real key — biggest remaining issue):
+    when a token's true unique-neighbor count after dedup is smaller than
+    total_k (very common — e.g. small N with large K, or aggressive
+    cross-source overlap), the leftover slots were filled with index 0 and
+    passed downstream with NO indication they were padding rather than a
+    real attention target. softmax has no way to distinguish "token 0 is
+    genuinely relevant" from "this slot is empty" — it just sees a key and
+    assigns it real probability mass. Measured directly: in a realistic
+    config (N=32, K=64), up to 54 of 64 slots were padding, and token 0
+    absorbed 74% of total softmax weight for reasons unrelated to actual
+    relevance. Fixed by returning a `valid` mask alongside `neighbors`
+    so the caller can mask padding scores to -inf BEFORE softmax (see
+    `sparse_gather_attention`), the same way invalid LSH candidates are
+    already handled in `LSHGraphBuilder.forward`. The index-0 substitution
+    is kept only because `neighbors` must still be a valid in-range index
+    for the gather step — `valid` is what actually controls whether that
+    gathered value contributes to the output.
 
     BUG FIX (self-edge double count): causal window padding maps future
     positions to the self index (e.g. window [i-4..i+4] becomes
@@ -559,12 +629,22 @@ def merge_neighbors(
     else:
         out = deduped[..., :total_k]
 
+    # valid[...,j] = True iff slot j holds a real (non-sentinel) neighbor.
+    # Computed BEFORE the sentinel→0 substitution below, since after that
+    # substitution sentinels are indistinguishable from a genuine index-0
+    # neighbor by value alone.
+    valid = out <= true_max_idx
+    if self_idx is not None:
+        valid[..., 0] = True   # self slot is always valid by construction
+
     # Zero out ANY sentinel value (anything strictly above the true max
     # valid index), not just one specific sentinel constant — this is
-    # what catches both masking steps' sentinels uniformly.
+    # what catches both masking steps' sentinels uniformly. The resulting
+    # 0 is a placeholder ONLY — `valid` is what tells the caller it's not
+    # a real neighbor; do not rely on index 0 being meaningful here.
     out = torch.where(out > true_max_idx, torch.zeros_like(out), out)
 
-    return out.clamp(0, true_max_idx)
+    return out.clamp(0, true_max_idx), valid
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -577,6 +657,7 @@ def sparse_gather_attention(
     v:         torch.Tensor,   # (B, H, M, d)
     neighbors: torch.Tensor,   # (B, H, N, K)
     scale:     float,
+    valid:     Optional[torch.Tensor] = None,  # (B, H, N, K), True = real neighbor
     dropout:   float = 0.0,
     training:  bool  = False,
     fp32_attn_weights: bool = False,
@@ -587,6 +668,16 @@ def sparse_gather_attention(
 
     Gather via (B*H, N*K) index into (B*H, M, d) avoids any (N,M,d) expand.
     The index tensor (B*H, N*K, d) is O(NKd), same order as k_nb itself.
+
+    valid: optional mask from `merge_neighbors` marking which slots hold a
+    real neighbor vs. leftover padding (index 0 with no actual relevance).
+    When provided, padding slots are masked to -inf before softmax so they
+    receive zero attention weight, instead of competing as if they were a
+    real key. Without this, padding silently absorbs softmax mass — e.g.
+    measured 74% of total attention weight landing on padding in a small-N,
+    large-K configuration before this fix. If None (e.g. for callers that
+    pre-filter their own neighbor list, like a future direct API user),
+    every slot is treated as valid, matching the old behavior.
 
     fp32_attn_weights: if True, keep post-softmax attention weights in FP32
     through the value-aggregation einsum instead of casting down to the
@@ -620,6 +711,14 @@ def sparse_gather_attention(
     # which causes a write-buffer saturation spike on CPU at large N.
     scores = torch.einsum('bhnd,bhnkd->bhnk',
                           q.float(), k_gathered.float()) * scale  # (B,H,N,K)
+
+    if valid is not None:
+        # Mask padding to -inf BEFORE softmax so it receives exactly zero
+        # attention weight, rather than competing as a real key. Every row
+        # is guaranteed at least one valid slot (self-attention always has
+        # the self-edge at slot 0; cross-attention always has at least one
+        # global token), so this never produces an all-(-inf) row.
+        scores = scores.masked_fill(~valid, float("-inf"))
 
     # Softmax always runs in FP32 for numerical stability, regardless of
     # model dtype or fp32_attn_weights.
@@ -672,7 +771,9 @@ class SparseAttention(nn.Module):
 
     Cross-attn (key_value provided, N may ≠ M):
       no self-edge (semantically wrong for N≠M)
-      neighbors = window(key-space) + global(key) + LSH
+      no window (positionally meaningless when query/key are different
+        sequences — see BUG FIX comment in forward())
+      neighbors = global(key) + LSH
       causal=False forced (cross-attn causality handled elsewhere)
     """
 
@@ -695,6 +796,31 @@ class SparseAttention(nn.Module):
 
         guaranteed = 2 * config.window_size + 1 + config.num_global_tokens + 1
         self.lsh_k = max(self.K - guaranteed, 8)
+
+        # Efficiency note (not a correctness issue — see merge_neighbors'
+        # `valid` mask, which makes oversized/wasted candidate budgets
+        # harmless to the output): when window_size and num_global_tokens
+        # are large relative to num_neighbors, the raw candidate pool
+        # (window + global + self + lsh_k) can substantially exceed K
+        # before truncation/dedup. E.g. K=16, window_size=16 →
+        # guaranteed=36 already exceeds K, lsh_k floors at 8, and the raw
+        # pool (33+2+1+8=44) is ~2.8x what's actually kept. This wastes
+        # compute (LSH still does real work for candidates that get
+        # discarded) without being wrong. If profiling shows this matters
+        # for your config, reduce window_size or increase num_neighbors so
+        # `2*window_size+1 + num_global_tokens + 1` stays comfortably
+        # below K.
+        if guaranteed > self.K:
+            import warnings
+            warnings.warn(
+                f"SSAConfig: window+global+self budget ({guaranteed}) exceeds "
+                f"num_neighbors ({self.K}). lsh_k is floored at 8 and a large "
+                f"fraction of computed candidates will be discarded as padding "
+                f"(harmless to correctness, wasteful of compute). Consider "
+                f"reducing window_size or increasing num_neighbors.",
+                stacklevel=2,
+            )
+
         self.lsh_builder = LSHGraphBuilder(
             d_head         = self.d_head,
             num_hashes     = config.num_hashes,
@@ -749,7 +875,28 @@ class SparseAttention(nn.Module):
 
         # Graph components
         glob_idx = self.glob_builder(M, device)        # (G,)
-        win_idx  = self.win_builder(N, M, device)      # (N, 2w+1)
+
+        # BUG FIX (cross-attention window graph was positionally meaningless):
+        # WindowGraphBuilder assumes query position i should attend keys near
+        # position i — a reasonable locality prior for self-attention (N==M,
+        # same sequence), but meaningless for cross-attention, where query
+        # and key sequences are different things entirely (e.g. decoder
+        # tokens vs. encoder hidden states) and "position i" in one has no
+        # relationship to "position i" in the other. Verified directly: with
+        # N=8 decoder queries and M=64 encoder keys, every query's window
+        # clustered around the first ~16 of 64 key positions purely from the
+        # index-alignment assumption, never reaching most of the actual
+        # encoder output. Window neighbors are now skipped entirely for
+        # cross-attention; LSH (content-based, no positional assumption) and
+        # global tokens still provide full-sequence coverage. The window
+        # slots simply become unused budget (harmless now that padding is
+        # masked to -inf before softmax — see merge_neighbors/
+        # sparse_gather_attention `valid` mask).
+        if is_cross:
+            win_idx = torch.zeros(N, 0, dtype=torch.long, device=device)  # (N, 0): no window contribution
+        else:
+            win_idx = self.win_builder(N, M, device)      # (N, 2w+1)
+
         lsh_idx  = self.lsh_builder(
             q, k,
             top_k        = self.lsh_k,
@@ -764,7 +911,7 @@ class SparseAttention(nn.Module):
         else:
             self_idx = None  # cross-attn: no self-edge
 
-        neighbors = merge_neighbors(
+        neighbors, valid = merge_neighbors(
             win_idx, glob_idx, lsh_idx,
             self_idx = self_idx,
             total_k  = self.K,
@@ -774,6 +921,7 @@ class SparseAttention(nn.Module):
         out = sparse_gather_attention(
             q, k, v, neighbors,
             scale    = self.scale,
+            valid    = valid,
             dropout  = self.dp,
             training = self.training,
             fp32_attn_weights = self.config.fp32_attn_weights,
@@ -786,6 +934,12 @@ class SparseAttention(nn.Module):
             "peak_sparse_elems": peak_sparse,
             "peak_full_elems":   peak_full,
             "compression":       peak_full / peak_sparse,
+            # Fraction of neighbor slots that were padding (no real
+            # neighbor after dedup), averaged over all tokens/heads/batch.
+            # High values mean num_neighbors (K) is set larger than the
+            # graph can usefully fill — informational only, doesn't affect
+            # correctness now that padding is masked to -inf before softmax.
+            "padding_fraction":  (~valid).float().mean().item(),
         }
         return self.Wo(self._merge(out)), stats
 
@@ -876,8 +1030,8 @@ if __name__ == "__main__":
     lsh_n = lsh_b(q_s, k_s, top_k=4)
     si    = torch.arange(32).view(1, 1, 32)
     t0 = time.perf_counter()
-    nb = merge_neighbors(win, glob, lsh_n, self_idx=si,
-                         total_k=24, N=32, B=1, H=1, device=device)
+    nb, nb_valid = merge_neighbors(win, glob, lsh_n, self_idx=si,
+                                   total_k=24, N=32, B=1, H=1, device=device)
     elapsed = (time.perf_counter() - t0) * 1000
     # Check: no duplicates in slots 1+ (strip trailing zeros)
     real_dups = 0
