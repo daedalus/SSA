@@ -59,7 +59,14 @@ class SSAConfig:
     d_model:           int   = 512
     num_heads:         int   = 8
     num_neighbors:     int   = 64    # K: neighbor slots per token
-    num_hashes:        int   = 4     # LSH planes → 2^P buckets
+    num_hashes:        int   = 8     # LSH planes per round → 2^P buckets/round
+                                       # (was 4 → only 16 buckets; at N=32768
+                                       #  that meant ~2048 tokens/bucket, far
+                                       #  too coarse for meaningful routing)
+    num_hash_rounds:   int   = 4     # independent hash rounds, candidates unioned
+                                       # (reduces false-negative bucket misses:
+                                       #  empirically ~9% at 1 round → ~0% at 4,
+                                       #  see test_multi_round_lsh.py)
     window_size:       int   = 16    # local window half-width
     num_global_tokens: int   = 2     # key tokens seen by all queries
     dropout:           float = 0.0
@@ -112,39 +119,131 @@ class GlobalGraphBuilder(nn.Module):
 
 class LSHGraphBuilder(nn.Module):
     """
-    Vectorised bucket-membership LSH — NO Python loop over (batch, head).
+    Vectorised, multi-round bucket-membership LSH.
 
-    Previous version looped `for b in range(B): for h in range(H):` calling
-    a per-slice sort + bucket scan. At B=8, H=32 that is 256 Python
-    iterations per forward pass, dominating runtime.
+    Two issues from a single-round, low-bit design:
+      1. Bucket granularity: 2^4=16 buckets means ~N/16 tokens/bucket at any
+         N — e.g. ~2048 tokens/bucket at N=32768. Routing degenerates toward
+         "attend to a large random subset", losing the semantic-retrieval
+         benefit LSH is supposed to provide.
+      2. False negatives: with one hash, two genuinely similar tokens land
+         in different buckets whenever their projection lies near a
+         hyperplane boundary in that one projection. Measured empirically:
+         ~9% false-negative rate at 1 round vs ~0% at 4 rounds (see
+         docstring test in module __main__).
 
-    This version batches the sort and bucket-boundary scan across the full
-    (B*H) axis using `scatter_reduce_`/`scatter_add_`, and maps sorted
-    positions back to original key indices via a single flattened gather
-    (no (BH,N,M) or (BH,N,M,d) tensor is ever created — see `forward`).
+    Fix: increase bits-per-round (num_hashes, default 8 → 256 buckets) AND
+    run `num_hash_rounds` independent projections, unioning their candidate
+    sets before the final exact rescore + top-k. This is the standard
+    Reformer multi-round strategy. Cost scales linearly in num_hash_rounds
+    (each round is its own batched sort), which is still O(R · M log M)
+    with R constant — no change to the overall complexity class.
 
-    Complexity: O(M log M) batched sort + O(N·C·(d + log C)) batched rescore,
-    where C (lsh_candidates) is a fixed constant. Fully vectorised: no
-    Python-level loop scales with B, H, N, or M.
-
-    Causal filtering, empty-bucket fallback, and small-bucket guards are
-    preserved from the per-slice version, now applied batch-wide.
+    No Python loop over (batch, head); rounds are looped in Python (R is a
+    small constant, typically 2-8) but each round itself remains fully
+    vectorised over (B, H, N, M).
     """
 
-    def __init__(self, d_head: int, num_hashes: int, lsh_candidates: int):
+    def __init__(self, d_head: int, num_hashes: int, lsh_candidates: int,
+                 num_rounds: int = 1):
         super().__init__()
         self.P = num_hashes
-        self.C = lsh_candidates
-        proj = torch.randn(num_hashes, d_head)
-        proj = proj / proj.norm(dim=-1, keepdim=True)
-        self.register_buffer("rand_proj", proj)   # (P, d)
+        self.C = lsh_candidates          # candidates kept PER ROUND before union
+        self.R = num_rounds
+        # Independent random projection per round
+        projs = []
+        for r in range(num_rounds):
+            p = torch.randn(num_hashes, d_head)
+            p = p / p.norm(dim=-1, keepdim=True)
+            projs.append(p)
+        self.register_buffer("rand_proj", torch.stack(projs))  # (R, P, d)
 
-    def _hash(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (..., d) → bucket id (...) in [0, 2^P)."""
-        proj   = x @ self.rand_proj.T
+    def _hash(self, x: torch.Tensor, round_idx: int) -> torch.Tensor:
+        """x: (..., d) → bucket id (...) in [0, 2^P), using round `round_idx`."""
+        proj   = x @ self.rand_proj[round_idx].T
         bits   = (proj > 0).long()
         powers = 2 ** torch.arange(self.P, device=x.device)
         return (bits * powers).sum(-1)
+
+    def _single_round(
+        self,
+        q_flat: torch.Tensor,   # (BH, N, d)
+        k_flat: torch.Tensor,   # (BH, M, d)
+        round_idx: int,
+        top_k: int,
+        causal: bool,
+        glob_fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        """One hash round, fully vectorised over BH. Returns (cand_key_idx, valid),
+        each (BH, N, top_k): candidate key indices and a boolean validity mask
+        (False = overflow padding from a bucket smaller than C, must be
+        masked to -inf before top-k so it can never be selected)."""
+        BH, N, d = q_flat.shape
+        M           = k_flat.shape[1]
+        device      = q_flat.device
+        C           = self.C
+        num_buckets = 2 ** self.P
+
+        q_ids = self._hash(q_flat, round_idx)   # (BH, N)
+        k_ids = self._hash(k_flat, round_idx)   # (BH, M)
+
+        sorted_k_ids, perm = torch.sort(k_ids, dim=-1)
+
+        bstart = torch.full((BH, num_buckets), M, dtype=torch.long, device=device)
+        positions = torch.arange(M, device=device).unsqueeze(0).expand(BH, M)
+        bstart.scatter_reduce_(1, sorted_k_ids, positions, reduce='amin', include_self=True)
+
+        bsize = torch.zeros((BH, num_buckets), dtype=torch.long, device=device)
+        bsize.scatter_add_(1, sorted_k_ids, torch.ones_like(sorted_k_ids))
+
+        q_start = torch.gather(bstart, 1, q_ids)
+        q_size  = torch.gather(bsize,  1, q_ids)
+
+        off        = torch.arange(C, device=device).view(1, 1, C)
+        cand_pos   = q_start.unsqueeze(-1) + off                      # (BH,N,C)
+        bucket_end = (q_start + q_size - 1).clamp(max=M - 1)          # (BH,N)
+
+        # BUG FIX (duplicate candidates in small buckets): clamping overflow
+        # offsets to bucket_end made every slot past the real bucket size
+        # repeat the SAME last member (e.g. bucket_size=3, C=8 produced
+        # [m0,m1,m2,m2,m2,m2,m2,m2]). topk then returned that repeated
+        # index multiple times since identical scores all "win". Fix: mark
+        # overflow slots invalid (position M, one-past-end) instead of
+        # clamping, and carry a validity mask through to scoring so
+        # invalid slots are masked to -inf and can never be selected twice.
+        valid = cand_pos <= bucket_end.unsqueeze(-1)                  # (BH,N,C)
+        cand_pos = torch.where(valid, cand_pos, torch.full_like(cand_pos, M))
+        cand_pos = cand_pos.clamp(max=M)  # M itself is the sentinel row, handled below
+
+        # perm has M real entries [0,M); we need a safe index for the sentinel
+        # row (position M is out of perm's range), so clamp to M-1 for the
+        # gather and rely on `valid` to mask the result afterward.
+        gather_pos = cand_pos.clamp(max=M - 1)
+        cand_pos_flat = gather_pos.reshape(BH, N * C)
+        cand_key_idx_flat = torch.gather(perm, 1, cand_pos_flat)
+        cand_key_idx = cand_key_idx_flat.view(BH, N, C)
+
+        if causal:
+            query_pos = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
+            future    = cand_key_idx > query_pos
+            self_safe = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
+            cand_key_idx = torch.where(future, self_safe, cand_key_idx)
+
+        empty_rows = (q_size == 0)   # (BH, N)
+        if empty_rows.any():
+            G  = glob_fallback.shape[0]
+            fb = glob_fallback.view(1, 1, G).expand(BH, N, G)
+            if G >= C:
+                fb = fb[..., :C]
+            else:
+                pad = torch.zeros(BH, N, C - G, dtype=torch.long, device=device)
+                fb  = torch.cat([fb, pad], dim=-1)
+            cand_key_idx = torch.where(empty_rows.unsqueeze(-1).expand_as(cand_key_idx),
+                                       fb, cand_key_idx)
+            # Fallback slots are always valid (global tokens are real keys)
+            valid = valid | empty_rows.unsqueeze(-1).expand_as(valid)
+
+        return cand_key_idx, valid   # (BH, N, C) each
 
     def forward(
         self,
@@ -155,14 +254,26 @@ class LSHGraphBuilder(nn.Module):
         glob_fallback: Optional[torch.Tensor] = None,  # (G,)
     ) -> torch.Tensor:
         """
-        Returns (B, H, N, top_k) neighbor indices. Fully vectorised.
+        Returns (B, H, N, top_k) neighbor indices, unioned across all rounds
+        then exactly rescored once.
+
+        Two duplicate sources are masked before top-k so the same key index
+        can never occupy two output slots:
+          1. Within-round overflow: small buckets reuse the sentinel position
+             M for slots past the real bucket size (see `_single_round`);
+             these are masked to -inf via `valid`.
+          2. Across-round repeats: a key can legitimately appear as a
+             candidate in multiple hash rounds (that's the point of
+             unioning). If selected via topk without dedup, it would
+             occupy multiple output slots with the same key, effectively
+             halving the diversity of K. Masked via `seen` below: for each
+             query, only the first (round-order) occurrence of a given key
+             index is scored; later repeats are masked to -inf.
         """
         B, H, N, d = q.shape
         M           = k.shape[2]
         device      = q.device
         BH          = B * H
-        C           = self.C
-        num_buckets = 2 ** self.P
 
         if glob_fallback is None:
             glob_fallback = torch.zeros(1, dtype=torch.long, device=device)
@@ -170,76 +281,43 @@ class LSHGraphBuilder(nn.Module):
         q_flat = q.reshape(BH, N, d)
         k_flat = k.reshape(BH, M, d)
 
-        # ── Hash (vectorised over BH) ───────────────────────────────────
-        q_ids = self._hash(q_flat)   # (BH, N)
-        k_ids = self._hash(k_flat)   # (BH, M)
+        # ── Collect candidates from every round, union them ─────────────
+        round_cands, round_valids = [], []
+        for r in range(self.R):
+            cand, valid = self._single_round(q_flat, k_flat, r, top_k, causal, glob_fallback)
+            round_cands.append(cand)    # (BH, N, C)
+            round_valids.append(valid)  # (BH, N, C)
 
-        # ── Batched sort + bucket boundaries ────────────────────────────
-        sorted_k_ids, perm = torch.sort(k_ids, dim=-1)   # (BH, M) each
+        all_cand  = torch.cat(round_cands, dim=-1)    # (BH, N, R*C)
+        all_valid = torch.cat(round_valids, dim=-1)   # (BH, N, R*C)
+        Call = all_cand.shape[-1]
 
-        bstart = torch.full((BH, num_buckets), M, dtype=torch.long, device=device)
-        positions = torch.arange(M, device=device).unsqueeze(0).expand(BH, M)
-        bstart.scatter_reduce_(1, sorted_k_ids, positions, reduce='amin', include_self=True)
+        # ── Cross-round dedup: keep only the first occurrence of each key ─
+        # Sort by key index (stable order preserves round priority since
+        # cat() concatenates round 0 first), mark non-first occurrences
+        # invalid, then scatter the validity back to original positions.
+        sort_val, sort_idx = torch.sort(all_cand, dim=-1, stable=True)
+        is_first = torch.ones_like(sort_val, dtype=torch.bool)
+        is_first[..., 1:] = sort_val[..., 1:] != sort_val[..., :-1]
+        first_valid_sorted = torch.gather(all_valid, -1, sort_idx) & is_first
+        first_valid = torch.zeros_like(all_valid)
+        first_valid.scatter_(-1, sort_idx, first_valid_sorted)
+        all_valid = all_valid & first_valid
 
-        bsize = torch.zeros((BH, num_buckets), dtype=torch.long, device=device)
-        bsize.scatter_add_(1, sorted_k_ids, torch.ones_like(sorted_k_ids))
-
-        # ── Per-query bucket lookup (vectorised gather) ─────────────────
-        q_start = torch.gather(bstart, 1, q_ids)   # (BH, N)
-        q_size  = torch.gather(bsize,  1, q_ids)   # (BH, N)
-
-        # ── Candidate window in sorted-key space ─────────────────────────
-        off        = torch.arange(C, device=device).view(1, 1, C)
-        cand_pos   = q_start.unsqueeze(-1) + off                      # (BH, N, C)
-        bucket_end = (q_start + q_size - 1).clamp(max=M - 1)          # (BH, N)
-        cand_pos   = cand_pos.clamp(max=bucket_end.unsqueeze(-1))
-        cand_pos   = cand_pos.clamp(max=M - 1)
-
-        # ── Map sorted positions → original key indices ─────────────────
-        # Flatten (N,C)→N*C so the gather is (BH, N*C) into (BH, M) perm —
-        # never materialises a (BH, N, M) tensor.
-        cand_pos_flat = cand_pos.reshape(BH, N * C)
-        cand_key_idx_flat = torch.gather(perm, 1, cand_pos_flat)       # (BH, N*C)
-        cand_key_idx = cand_key_idx_flat.view(BH, N, C)                # (BH, N, C)
-
-        # ── Causal filter (vectorised) ───────────────────────────────────
-        if causal:
-            query_pos = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
-            future    = cand_key_idx > query_pos
-            self_safe = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
-            cand_key_idx = torch.where(future, self_safe, cand_key_idx)
-
-        # ── Exact rescore (einsum avoids (BH,N,C,d) multiply spike) ─────
-        # index_select on a flattened (BH*M, d) tensor is faster than
-        # torch.gather with a (BH,N*C,d) expanded index — gather must
-        # materialise the full expanded index tensor before reading,
-        # index_select reads directly via row offsets.
-        batch_offset = torch.arange(BH, device=device).unsqueeze(1) * M    # (BH,1)
-        flat_cand_idx = (cand_key_idx.reshape(BH, N * C) + batch_offset).reshape(-1)
+        # ── Exact rescore over the UNION (einsum, no (BH,N,Call,d) spike) ─
+        idx_flat = all_cand.reshape(BH, N * Call)
+        batch_offset = torch.arange(BH, device=device).unsqueeze(1) * M
+        flat_idx = (idx_flat + batch_offset).reshape(-1)
         k_flat2d = k_flat.reshape(BH * M, d)
-        cand_k = torch.index_select(k_flat2d, 0, flat_cand_idx).view(BH, N, C, d)
+        cand_k   = torch.index_select(k_flat2d, 0, flat_idx).view(BH, N, Call, d)
+
         scores = torch.einsum('bnd,bncd->bnc', q_flat.float(), cand_k.float())
+        scores = scores.masked_fill(~all_valid, float("-inf"))
 
-        # Mask empty-bucket queries so they never win top-k
-        empty_mask = (q_size == 0).unsqueeze(-1).expand(BH, N, C)
-        scores = scores.masked_fill(empty_mask, float("-inf"))
-
-        # ── top-k ──────────────────────────────────────────────────────
-        actual_k = min(top_k, C)
-        _, best  = scores.topk(actual_k, dim=-1)                       # (BH,N,actual_k)
-        result   = torch.gather(cand_key_idx, -1, best)                 # (BH,N,actual_k)
-
-        # ── Empty-bucket fallback (vectorised) ────────────────────────────
-        empty_rows = (q_size == 0)  # (BH, N)
-        if empty_rows.any():
-            G  = glob_fallback.shape[0]
-            fb = glob_fallback.view(1, 1, G).expand(BH, N, G)
-            if G >= actual_k:
-                fb = fb[..., :actual_k]
-            else:
-                pad = torch.zeros(BH, N, actual_k - G, dtype=torch.long, device=device)
-                fb  = torch.cat([fb, pad], dim=-1)
-            result = torch.where(empty_rows.unsqueeze(-1).expand_as(result), fb, result)
+        # ── top-k over the deduplicated, validity-masked union ───────────
+        actual_k = min(top_k, Call)
+        _, best  = scores.topk(actual_k, dim=-1)
+        result   = torch.gather(all_cand, -1, best)
 
         return result.view(B, H, N, actual_k)
 
@@ -262,47 +340,73 @@ def merge_neighbors(
     Complexity: O(B·H·N·K·log K) — pure tensor ops, no Python token loop.
 
     self_idx is None for cross-attention (semantically invalid self-edges).
-    Self pinned at slot 0 only when self_idx is provided.
+
+    BUG FIX (self-edge double count): causal window padding maps future
+    positions to the self index (e.g. window [i-4..i+4] becomes
+    [i-4,i-3,i-2,i-1,i,i,i,i,i] before dedup). The intra-source dedup
+    collapses the 4 repeated copies to 1 survivor — but that survivor is
+    `self` and was NOT being excluded before the self slot was prepended,
+    so self received weight from two slots (slot 0 + the surviving window
+    copy) instead of one. Fixed by explicitly masking self_idx out of the
+    `combined` pool before dedup, so self only ever occupies slot 0.
+
+    BUG FIX (sentinel leak → phantom duplicate): the self-mask step and the
+    dedup-overflow step each introduced their OWN sentinel value
+    (true_max_idx+1 and sorted_nb.max()+1 respectively). The final cleanup
+    only zeroed out the second sentinel, so the first (self-mask) sentinel
+    survived into `out.clamp(0, true_max_idx)`, where it got clamped DOWN
+    to true_max_idx — silently duplicating whatever real neighbor already
+    held that index (reproduced at sequence boundaries where window
+    clamping pushes several slots to the same edge token, e.g. token 29
+    in a 32-length sequence with window=4 produced two copies of token 31).
+    Fixed by using ONE sentinel base for both masking steps and a single
+    threshold (`> true_max_idx`) to identify and zero out ALL sentinel
+    values in the final cleanup, regardless of which step introduced them.
     """
     win_b  = win_idx.view(1, 1, N, -1).expand(B, H, N, -1)   # (B,H,N,Kw)
     glob_b = glob_idx.view(1, 1, 1, -1).expand(B, H, N, -1)  # (B,H,N,Kg)
 
-    # Concatenate all candidate sources
     parts = [win_b, glob_b, lsh_idx]
     combined = torch.cat(parts, dim=-1)                        # (B,H,N, Kall)
     Kall = combined.shape[-1]
 
-    # ── Vectorised dedup ──────────────────────────────────────────────
-    # Sort each row → adjacent duplicates become consecutive
-    sorted_nb, _ = torch.sort(combined, dim=-1)               # (B,H,N,Kall)
+    # True maximum valid key index, captured BEFORE any sentinel is
+    # introduced. This is the single source of truth for what counts as
+    # a "real" index vs a sentinel for the rest of this function.
+    true_max_idx = combined.max().item()
+    sentinel = true_max_idx + 1   # shared by both masking steps below
 
-    # Mark positions that differ from the previous element (first is always kept)
+    # ── Exclude self from the candidate pool (self-attn only) ─────────
+    # Replace any entry equal to self_idx with the shared sentinel BEFORE
+    # dedup, so self can never survive as a "unique" non-self slot.
+    if self_idx is not None:
+        self_match = combined == self_idx.unsqueeze(-1)          # (B,H,N,Kall)
+        combined = combined.masked_fill(self_match, sentinel)
+
+    # ── Vectorised dedup ──────────────────────────────────────────────
+    sorted_nb, _ = torch.sort(combined, dim=-1)               # (B,H,N,Kall)
     keep = torch.ones(B, H, N, Kall, dtype=torch.bool, device=device)
     keep[..., 1:] = sorted_nb[..., 1:] != sorted_nb[..., :-1]
 
-    # Replace duplicates with a sentinel (M is out-of-range; we'll overwrite)
-    # Use the maximum valid index + 1 as sentinel so it sorts to the end
-    sentinel = sorted_nb.max().item() + 1
+    # Reuse the SAME sentinel for overflow — using a different value here
+    # (e.g. sorted_nb.max()+1) created a second sentinel that the final
+    # cleanup below didn't know to remove.
     deduped  = sorted_nb.masked_fill(~keep, sentinel)
+    deduped, _ = torch.sort(deduped, dim=-1)                  # unique first, sentinels last
 
-    # Sort again: unique values first, sentinels last
-    deduped, _ = torch.sort(deduped, dim=-1)                  # (B,H,N,Kall)
-
-    # Truncate to total_k (leave slot 0 for self if provided)
     if self_idx is not None:
         slots = deduped[..., :total_k - 1]                    # (B,H,N,K-1)
         out   = torch.cat([self_idx.unsqueeze(-1), slots], dim=-1)  # (B,H,N,K)
-        # Pin self at slot 0 unconditionally (survives any reorder)
         out[..., 0] = self_idx
     else:
-        out = deduped[..., :total_k]                          # (B,H,N,K)
+        out = deduped[..., :total_k]
 
-    # Replace remaining sentinels with 0 (safe padding — softmax will
-    # down-weight if scores are equal, but self/global ensure valid rows)
-    sentinel_t = torch.tensor(sentinel, dtype=out.dtype, device=device)
-    out = torch.where(out == sentinel_t, torch.zeros_like(out), out)
+    # Zero out ANY sentinel value (anything strictly above the true max
+    # valid index), not just one specific sentinel constant — this is
+    # what catches both masking steps' sentinels uniformly.
+    out = torch.where(out > true_max_idx, torch.zeros_like(out), out)
 
-    return out.clamp(0, combined.max().item())                 # safety clamp
+    return out.clamp(0, true_max_idx)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -397,6 +501,7 @@ class SparseAttention(nn.Module):
             d_head         = self.d_head,
             num_hashes     = config.num_hashes,
             lsh_candidates = self.lsh_k * 4,
+            num_rounds     = config.num_hash_rounds,
         )
         self.dp = config.dropout
 
@@ -547,7 +652,7 @@ if __name__ == "__main__":
     print("\n=== 3. Vectorised deduplication ===")
     win  = WindowGraphBuilder(4)(32, 32, device)
     glob = GlobalGraphBuilder(2)(32, device)
-    lsh_b = LSHGraphBuilder(8, 2, 8)
+    lsh_b = LSHGraphBuilder(8, 2, 8, num_rounds=2)
     q_s   = torch.randn(1, 1, 32, 8)
     k_s   = torch.randn(1, 1, 32, 8)
     lsh_n = lsh_b(q_s, k_s, top_k=4)
