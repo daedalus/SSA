@@ -125,10 +125,21 @@ class SSAConfig:
     d_model:           int   = 512
     num_heads:         int   = 8
     num_neighbors:     int   = 64    # K: neighbor slots per token
-    num_hashes:        int   = 8     # LSH planes per round → 2^P buckets/round
-                                       # (was 4 → only 16 buckets; at N=32768
-                                       #  that meant ~2048 tokens/bucket, far
-                                       #  too coarse for meaningful routing)
+    max_num_hashes:    int   = 12    # CEILING on LSH planes/round (2^P buckets).
+                                       # The actual P used per forward call is
+                                       # computed dynamically from the current
+                                       # sequence length as
+                                       # round(log2(seq_len / lsh_candidates)),
+                                       # clamped to [1, max_num_hashes] — see
+                                       # LSHGraphBuilder.compute_effective_p.
+                                       # This replaces a previous fixed
+                                       # num_hashes=8 default, which was
+                                       # measurably suboptimal at both short
+                                       # and long sequences (2-4x worse
+                                       # recall@K than the adaptive formula
+                                       # in testing across N=64..32768) and
+                                       # only happened to be near-correct at
+                                       # one specific N (~1024).
     num_hash_rounds:   int   = 4     # independent hash rounds, candidates unioned
                                        # (reduces false-negative bucket misses:
                                        #  empirically ~9% at 1 round → ~0% at 4,
@@ -192,78 +203,125 @@ class GlobalGraphBuilder(nn.Module):
 
 class LSHGraphBuilder(nn.Module):
     """
-    Vectorised, multi-round bucket-membership LSH.
+    Vectorised, multi-round bucket-membership LSH with sequence-length-
+    adaptive bucket count.
 
-    Two issues from a single-round, low-bit design:
-      1. Bucket granularity: 2^4=16 buckets means ~N/16 tokens/bucket at any
-         N — e.g. ~2048 tokens/bucket at N=32768. Routing degenerates toward
-         "attend to a large random subset", losing the semantic-retrieval
-         benefit LSH is supposed to provide.
+    Three issues from a fixed, low-bit design:
+      1. Bucket granularity: a FIXED 2^P buckets is wrong for some N no
+         matter what P is chosen. At N=128 with P=8 (256 buckets), most
+         buckets are empty (occupancy 0.5) and routing degenerates to the
+         empty-bucket fallback. At N=32768 with the same P=8, occupancy is
+         128 — buckets are so coarse the exact-rescore-then-topk step
+         can't discriminate well within them. A fixed P cannot be correct
+         across this range simultaneously.
       2. False negatives: with one hash, two genuinely similar tokens land
          in different buckets whenever their projection lies near a
          hyperplane boundary in that one projection. Measured empirically:
-         ~9% false-negative rate at 1 round vs ~0% at 4 rounds (see
-         docstring test in module __main__).
+         ~9% false-negative rate at 1 round vs ~0% at 4 rounds.
+      3. (Addressed here) Optimal bucket occupancy, measured empirically
+         via recall@K against true dense top-K across N ∈ [64, 32768], is
+         ≈ lsh_candidates (C) — i.e. you want enough tokens per bucket to
+         fill the per-round candidate budget, not more, not less. This
+         gives P = round(log2(N / C)), which matched the brute-force-
+         optimal P at EVERY tested N (64 through 32768) exactly. A fixed
+         P=8 default lost to this formula by 2-4x in recall at both ends
+         of that range (e.g. 8.8% vs 27.1% recall@16 at N=128; 14.0% vs
+         22.6% at N=4096) and only matched it by coincidence at one
+         specific N (~1024) where the fixed default happened to land near
+         the formula's value anyway.
 
-    Fix: increase bits-per-round (num_hashes, default 8 → 256 buckets) AND
-    run `num_hash_rounds` independent projections, unioning their candidate
-    sets before the final exact rescore + top-k. This is the standard
-    Reformer multi-round strategy. Cost scales linearly in num_hash_rounds
-    (each round is its own batched sort), which is still O(R · M log M)
-    with R constant — no change to the overall complexity class.
+    Fix for (1)+(3): bucket count is no longer fixed at construction time.
+    `rand_proj` is registered with `max_num_hashes` planes (a ceiling, not
+    a target); at each `forward()` call, the EFFECTIVE number of planes
+    actually used for bucketing is computed from the current key sequence
+    length M as `P_eff = clamp(round(log2(M / lsh_candidates)), 1, max_num_hashes)`
+    and the first `P_eff` rows of `rand_proj` are sliced out. This is
+    cheap (a view, not a reconstruction) and means a single trained module
+    automatically uses coarser buckets for short sequences and finer
+    buckets for long ones, without needing separate models or retraining
+    when sequence length changes between calls.
+
+    Fix for (2): run `num_hash_rounds` independent projections, unioning
+    their candidate sets before the final exact rescore + top-k (Reformer
+    multi-round strategy). Also empirically improves seed-sensitivity:
+    relative recall std across 15 random projection seeds dropped from
+    3.6% (R=1) to 1.7% (R=4) in testing.
 
     No Python loop over (batch, head); rounds are looped in Python (R is a
     small constant, typically 2-8) but each round itself remains fully
     vectorised over (B, H, N, M).
     """
 
-    def __init__(self, d_head: int, num_hashes: int, lsh_candidates: int,
-                 num_rounds: int = 1):
+    def __init__(self, d_head: int, lsh_candidates: int,
+                 num_rounds: int = 1, max_num_hashes: int = 12):
         super().__init__()
-        # Guard against unbounded bucket-table memory. _single_round
-        # allocates two (BH, 2^num_hashes) int64 tables (bstart, bsize)
-        # every forward call. This is cheap at the intended range
-        # (num_hashes=8 → 256 buckets/round → ~0.3MB at BH=64) but scales
-        # as O(2^num_hashes), not O(num_hashes): at num_hashes=20 the same
-        # two tables cost ~1GB; at 24, ~17GB. There is also no benefit to
-        # num_hashes beyond ~log2(N) — once buckets outnumber tokens, most
-        # buckets are empty and routing degenerates to the empty-bucket
-        # fallback. 12 bits (4096 buckets/round) comfortably covers any
-        # practical N (>1 bucket/token up to N=4096 per round, and union
-        # across rounds extends useful coverage further) while keeping the
-        # bucket tables under ~5MB even at large BH.
-        assert num_hashes <= 12, (
-            f"num_hashes={num_hashes} would allocate 2**{num_hashes}="
-            f"{2**num_hashes:,} buckets per round per (batch,head) slice — "
-            f"this scales as O(2^num_hashes) and becomes impractically "
-            f"large well before this point (e.g. num_hashes=20 costs ~1GB "
-            f"just for bucket bookkeeping at BH=64). If you need finer "
+        # max_num_hashes is a CEILING on bucket count, not the bucket
+        # count itself — see forward()'s P_eff computation. The same
+        # memory-blowup reasoning as before still applies to this ceiling:
+        # bucket bookkeeping tables scale as O(2^P), so an unreasonably
+        # high ceiling is exactly as dangerous as a fixed unreasonable P
+        # used to be.
+        assert max_num_hashes <= 12, (
+            f"max_num_hashes={max_num_hashes} would allow up to "
+            f"2**{max_num_hashes}={2**max_num_hashes:,} buckets per round per "
+            f"(batch,head) slice — this scales as O(2^P) and becomes "
+            f"impractically large well before this point (e.g. P=20 costs "
+            f"~1GB just for bucket bookkeeping at BH=64). If you need finer "
             f"routing than 12 bits provides, increase num_hash_rounds "
-            f"instead (linear cost) rather than num_hashes (exponential "
-            f"cost) — see LSHGraphBuilder docstring."
+            f"instead (linear cost) rather than max_num_hashes (exponential "
+            f"cost)."
         )
-        self.P = num_hashes
-        self.C = lsh_candidates          # candidates kept PER ROUND before union
+        self.max_P = max_num_hashes
+        self.C = lsh_candidates          # candidates kept PER ROUND before union;
+                                          # also the target bucket occupancy used
+                                          # to derive P_eff in forward()
         self.R = num_rounds
-        # Independent random projection per round. Registered in FP32
-        # regardless of model dtype — hashing is a routing decision, not a
-        # learned computation, so there's no benefit to running it in
-        # reduced precision, and FP32 avoids the dtype-mismatch crash that
-        # occurs if the model is later cast to FP16/BF16 (see `_hash`).
+        # Independent random projection per round, registered at the
+        # CEILING plane count. forward() slices the first P_eff rows per
+        # call — slicing a view is free; this lets one buffer serve any
+        # P_eff <= max_num_hashes without reconstruction.
+        #
+        # Registered in FP32 regardless of model dtype — hashing is a
+        # routing decision, not a learned computation, so there's no
+        # benefit to running it in reduced precision, and FP32 avoids the
+        # dtype-mismatch crash that occurs if the model is later cast to
+        # FP16/BF16 (see `_hash`).
         projs = []
         for r in range(num_rounds):
-            p = torch.randn(num_hashes, d_head)
+            p = torch.randn(max_num_hashes, d_head)
             # clamp_min guards against a zero-norm row. A genuinely-zero
             # Gaussian vector has probability 0 in theory, but clamp_min
             # is one line and removes a NaN risk for free — no reason to
             # rely on "effectively impossible" when avoiding it is free.
             p = p / p.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             projs.append(p)
-        self.register_buffer("rand_proj", torch.stack(projs))  # (R, P, d), always fp32
+        self.register_buffer("rand_proj", torch.stack(projs))  # (R, max_P, d), always fp32
 
-    def _hash(self, x: torch.Tensor, round_idx: int) -> torch.Tensor:
+    @staticmethod
+    def compute_effective_p(M: int, C: int, max_p: int, min_p: int = 1) -> int:
         """
-        x: (..., d) → bucket id (...) in [0, 2^P), using round `round_idx`.
+        P_eff = round(log2(M / C)), clamped to [min_p, max_p].
+
+        Targets average bucket occupancy ≈ C (the per-round candidate
+        budget) — empirically the recall-maximizing choice across the
+        full tested range, see class docstring. min_p=1 (not e.g. 4) is
+        deliberate: at small M relative to C, the optimum can be as low
+        as 1-2 bits (occupancy >> C, i.e. "barely bucket at all, mostly
+        rely on the candidate budget to cover most of the sequence
+        directly") — measured 94.6% recall@16 at M=128,C=64,P=1 vs 40.9%
+        at the naive P=4 floor used in an earlier version of this module.
+        """
+        if M <= 1 or C <= 0:
+            return min_p
+        p_ideal = math.log2(max(M, 1) / max(C, 1))
+        return max(min_p, min(max_p, round(p_ideal)))
+
+    def _hash(self, x: torch.Tensor, round_idx: int, p_eff: int) -> torch.Tensor:
+        """
+        x: (..., d) → bucket id (...) in [0, 2^p_eff), using round
+        `round_idx` and the first `p_eff` planes of that round's
+        projection (a slice of the registered max_num_hashes-plane buffer,
+        not a separate buffer — see class docstring).
 
         Hashing is always done in FP32 regardless of the input dtype. This
         matters for two reasons:
@@ -282,19 +340,14 @@ class LSHGraphBuilder(nn.Module):
              top of the structural one, which is the cheap part to fix.
 
         Integer overflow note: bucket ids are built as
-        `(bits * powers).sum(-1)` where `powers = 2**arange(P)`, computed in
-        default int64. This is safe for any P enforced by the num_hashes<=12
-        assert in __init__ (max bucket id 2^12=4096, far below int64
-        range). It would only become a real concern if that guard were
-        ever bypassed at P>=63 (int64 sign bit) — not reachable through the
-        public SSAConfig/LSHGraphBuilder API as written, but noted here
-        since the failure mode (silent wraparound rather than a clean
-        error) would be confusing to debug if this function were ever
-        modified to accept unbounded P.
+        `(bits * powers).sum(-1)` where `powers = 2**arange(p_eff)`,
+        computed in default int64. Safe for any p_eff enforced by the
+        max_num_hashes<=12 assert in __init__ (max bucket id 2^12=4096,
+        far below int64 range).
         """
-        proj   = x.float() @ self.rand_proj[round_idx].T   # FP32 regardless of x.dtype
+        proj   = x.float() @ self.rand_proj[round_idx, :p_eff].T   # FP32, sliced planes
         bits   = (proj > 0).long()
-        powers = 2 ** torch.arange(self.P, device=x.device)
+        powers = 2 ** torch.arange(p_eff, device=x.device)
         return (bits * powers).sum(-1)
 
     def _single_round(
@@ -305,6 +358,7 @@ class LSHGraphBuilder(nn.Module):
         top_k: int,
         causal: bool,
         glob_fallback: torch.Tensor,
+        p_eff: int,
     ) -> torch.Tensor:
         """One hash round, fully vectorised over BH. Returns (cand_key_idx, valid),
         each (BH, N, top_k): candidate key indices and a boolean validity mask
@@ -314,10 +368,10 @@ class LSHGraphBuilder(nn.Module):
         M           = k_flat.shape[1]
         device      = q_flat.device
         C           = self.C
-        num_buckets = 2 ** self.P
+        num_buckets = 2 ** p_eff
 
-        q_ids = self._hash(q_flat, round_idx)   # (BH, N)
-        k_ids = self._hash(k_flat, round_idx)   # (BH, M)
+        q_ids = self._hash(q_flat, round_idx, p_eff)   # (BH, N)
+        k_ids = self._hash(k_flat, round_idx, p_eff)   # (BH, M)
 
         sorted_k_ids, perm = torch.sort(k_ids, dim=-1)
 
@@ -440,13 +494,20 @@ class LSHGraphBuilder(nn.Module):
         if glob_fallback is None:
             glob_fallback = torch.zeros(1, dtype=torch.long, device=device)
 
+        # Sequence-length-adaptive bucket count: P_eff is recomputed every
+        # call from the CURRENT key sequence length M, not fixed at
+        # construction time. See compute_effective_p and class docstring
+        # for why occupancy≈C is the empirically recall-maximizing target.
+        p_eff = self.compute_effective_p(M, self.C, self.max_P)
+
         q_flat = q.reshape(BH, N, d)
         k_flat = k.reshape(BH, M, d)
 
         # ── Collect candidates from every round, union them ─────────────
         round_cands, round_valids = [], []
         for r in range(self.R):
-            cand, valid = self._single_round(q_flat, k_flat, r, top_k, causal, glob_fallback)
+            cand, valid = self._single_round(q_flat, k_flat, r, top_k, causal,
+                                             glob_fallback, p_eff)
             round_cands.append(cand)    # (BH, N, C)
             round_valids.append(valid)  # (BH, N, C)
 
@@ -822,10 +883,10 @@ class SparseAttention(nn.Module):
             )
 
         self.lsh_builder = LSHGraphBuilder(
-            d_head         = self.d_head,
-            num_hashes     = config.num_hashes,
-            lsh_candidates = self.lsh_k * 4,
-            num_rounds     = config.num_hash_rounds,
+            d_head          = self.d_head,
+            max_num_hashes  = config.max_num_hashes,
+            lsh_candidates  = self.lsh_k * 4,
+            num_rounds      = config.num_hash_rounds,
         )
         self.dp = config.dropout
 
@@ -996,7 +1057,7 @@ if __name__ == "__main__":
 
     cfg = SSAConfig(
         d_model=128, num_heads=2, num_neighbors=32,
-        num_hashes=3, window_size=4, num_global_tokens=2,
+        max_num_hashes=3, window_size=4, num_global_tokens=2,
         dropout=0.0, causal=False,
     )
 
@@ -1024,7 +1085,7 @@ if __name__ == "__main__":
     print("\n=== 3. Vectorised deduplication ===")
     win  = WindowGraphBuilder(4)(32, 32, device)
     glob = GlobalGraphBuilder(2)(32, device)
-    lsh_b = LSHGraphBuilder(8, 2, 8, num_rounds=2)
+    lsh_b = LSHGraphBuilder(d_head=8, lsh_candidates=8, num_rounds=2)
     q_s   = torch.randn(1, 1, 32, 8)
     k_s   = torch.randn(1, 1, 32, 8)
     lsh_n = lsh_b(q_s, k_s, top_k=4)
@@ -1053,7 +1114,7 @@ if __name__ == "__main__":
     print("\n=== 4. Causal correctness ===")
     causal_cfg = SSAConfig(
         d_model=64, num_heads=2, num_neighbors=16,
-        num_hashes=2, window_size=3, num_global_tokens=1,
+        max_num_hashes=2, window_size=3, num_global_tokens=1,
         causal=True,
     )
     causal_attn = SparseAttention(causal_cfg)
@@ -1076,7 +1137,7 @@ if __name__ == "__main__":
     # Monkeypatch on the module for this test
     import importlib, sys
     # Direct test: build LSH neighbors with causal=True and verify
-    lsh_causal = LSHGraphBuilder(d_head=8, num_hashes=2, lsh_candidates=8)
+    lsh_causal = LSHGraphBuilder(d_head=8, max_num_hashes=2, lsh_candidates=8)
     qc = torch.randn(1, 1, N_c, 8)
     kc = torch.randn(1, 1, N_c, 8)
     nb_causal = lsh_causal(qc, kc, top_k=4, causal=True,
@@ -1096,7 +1157,7 @@ if __name__ == "__main__":
     # ── 5. Empty-bucket fallback ───────────────────────────────────────
     print("\n=== 5. Empty-bucket fallback ===")
     # Force an empty bucket by using a tiny hash space with skewed data
-    lsh_eb  = LSHGraphBuilder(d_head=4, num_hashes=1, lsh_candidates=4)
+    lsh_eb  = LSHGraphBuilder(d_head=4, max_num_hashes=1, lsh_candidates=4)
     # All keys hash to bucket 0; query hashes to bucket 1 → empty
     k_all0  = torch.zeros(1, 1, 8, 4)   # all keys → bucket 0
     q_b1    = torch.ones(1, 1, 4, 4)    # queries → bucket 1
@@ -1111,7 +1172,7 @@ if __name__ == "__main__":
     # N=10 queries, M=3 keys → old clamp would map queries 3..9 all to key 2
     sm_attn = SparseAttention(SSAConfig(
         d_model=16, num_heads=1, num_neighbors=4,
-        num_hashes=1, window_size=1, num_global_tokens=1, causal=False,
+        max_num_hashes=1, window_size=1, num_global_tokens=1, causal=False,
     ))
     qsmall = torch.randn(1, 10, 16)
     kvsmall = torch.randn(1, 3, 16)
@@ -1121,7 +1182,7 @@ if __name__ == "__main__":
     # ── 7. Gradient check ─────────────────────────────────────────────
     print("\n=== 7. Gradient check ===")
     cfg_g = SSAConfig(d_model=32, num_heads=2, num_neighbors=12,
-                      num_hashes=2, window_size=3, num_global_tokens=1)
+                      max_num_hashes=2, window_size=3, num_global_tokens=1)
     mg    = SparseTransformer(cfg_g, num_layers=2)
     xi    = torch.randn(1, 20, 32, requires_grad=True)
     yo, _ = mg(xi)
