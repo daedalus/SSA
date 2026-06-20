@@ -1,42 +1,91 @@
 """
-True Sub-Quadratic Sparse Attention (SSA) — v4
+True Sub-Quadratic Sparse Attention (SSA) — v7
 ===============================================
 
-Fixes from v3 review (priority order):
+Complexity, with constants made explicit (all are O(1) w.r.t. N, M):
 
-  Fix 1  CAUSAL LEAKAGE  — LSH neighbors now filtered to key_pos <= query_pos
-         in causal mode. Window was already causal; LSH was not.
-         This was the most serious correctness bug.
+  R = num_hash_rounds      (default 4)   — independent LSH hash functions
+  P = num_hashes           (default 8, capped at 12 by assert in
+                             LSHGraphBuilder.__init__)               — bits/round,
+                             buckets/round = 2^P
+  C = lsh_candidates       (= lsh_k * 4, derived from num_neighbors) — candidates
+                             rescored per round before union
+  K = num_neighbors        (config)      — final neighbor slots per token
+  d = d_model / num_heads                — per-head dimension
 
-  Fix 2  VECTORISED DEDUP — Python loop over B*H*N rows replaced with a
-         fully vectorised sort + adjacent-duplicate removal. No Python
-         iteration over tokens.
+  Per-round bucket build:    O(M log M)         torch.sort, batched over B·H
+  Per-round candidate gather: O(N · C · d)       index_select + einsum rescore
+  Union across rounds:        O(N · R·C · log(R·C))   sort-based cross-round dedup
+  Final top-k:                O(N · R·C · log K)
+  Merge with window/global:   O(N · K · log K)   vectorised sort-based dedup
+  Attention (gather+dot+agg): O(N · K · d)
 
-  Fix 3  EMPTY BUCKET — When a query's bucket is empty (q_size==0), fall
-         back to global tokens + self instead of clamping to key M-1.
+  TOTAL: O(M log M) + O(N · R · C · (d + log(R·C)))  — every term beyond
+  M log M is linear in N with a constant factor of R·C (typically
+  R·C ≈ 4·48 = 192 at defaults). This is the honest cost, not just "O(NK)";
+  the O(NK) attention step is real but is only one part of the forward pass
+  — graph construction is comparable in cost, sometimes larger, depending
+  on R and C relative to K. See per-component profiling in __main__.
 
-  Fix 4  SMALL BUCKET — When bucket has fewer keys than C candidates,
-         only rescore actual bucket members (no clamped repeats that waste
-         top-k slots).
+  Memory peak: O(N · K · d) for the final gathered K/V — no N×N tensor
+  anywhere in the entire pipeline (graph construction included).
 
-  Fix 5  CROSS-ATTN SELF-EDGE — For N≠M, self-edge (arange(N).clamp(M-1))
-         is semantically wrong. Replaced with global-token slot instead;
-         self-edge is only added for self-attention (N==M).
+Recent fixes (most recent first):
 
-  Fix 6  COMPLEXITY COMMENT — O(N·C·d + N·C·log C) documented correctly.
+  Fix: invalid-but-selected LSH candidates (a query whose true valid-
+       candidate count is far below the requested top_k, e.g. a tiny
+       bucket with C=64 candidate slots but 1 real member) used to resolve
+       to an arbitrary repeated REAL key index — the clamp target used to
+       keep gather in-bounds — rather than failing safely. The validity
+       mask correctly prevented these from being *preferred* by score, but
+       did not prevent them from being *copied into the output* once
+       topk was forced to select one. Fixed: any topk-selected slot with
+       score -inf is now overwritten with a global-token fallback index
+       instead of carrying forward whatever real key the clamp happened to
+       land on. Stress-tested 240 configs spanning tiny N, oversized K,
+       multiple seeds — zero NaN/Inf, see __main__.
 
-  Fix 7  CAUSAL NOTE IN DOCSTRING — LSH non-differentiability and causal
-         routing documented clearly.
+  Fix: num_hashes is now asserted <= 12. Bucket bookkeeping tables
+       (bstart, bsize) scale as O(2^num_hashes), not O(num_hashes) — at
+       num_hashes=20 this already costs ~1GB per forward call at typical
+       B·H. Increase num_hash_rounds (linear cost) instead of num_hashes
+       (exponential cost) for finer routing.
 
-Not fixed (by design):
-  - Gather temporary (B*H, N*K, d): correct O(NKd), tiling needs Triton.
-  - LSH routing non-differentiability: structural, matches Reformer.
+  Fix: q.dtype → v.dtype in the softmax cast-back, since attn is multiplied
+       against v, not q. Added optional fp32_attn_weights config flag to
+       keep attention weights in FP32 through value aggregation.
 
-Complexity:
-  Graph build:  O(M log M)  sort  +  O(N·C·(d + log C))  rescore+topk
-  Attention:    O(N·K·d)    gather + dot
-  Dedup:        O(B·H·N·K·log K)  vectorised (no Python loop)
-  Memory peak:  O(N·K·d)    — no N×N tensor anywhere
+  Fix: LSH hash projection now always runs in FP32 (previously crashed
+       outright under FP16/BF16 due to a dtype mismatch with the FP32
+       projection buffer). Projection normalization now uses clamp_min to
+       avoid a theoretical (if practically unreachable) divide-by-zero.
+
+  Fix: self-edge double-counting from causal window padding, and a
+       sentinel-leak bug that caused a phantom duplicate at sequence
+       boundaries — both found via targeted unit tests, see
+       merge_neighbors docstring for details.
+
+  Fix: bucket granularity (num_hashes 4→8) and single-hash false negatives
+       (added num_hash_rounds with unioned, cross-round-deduplicated
+       candidates) — empirically verified false-negative rate ~9% at 1
+       round, ~0% at 4 rounds.
+
+Known, accepted limitations (not bugs):
+
+  - LSH routing is non-differentiable (hard `proj > 0` threshold). Only
+    attention weights learn; the neighbor graph itself does not receive
+    gradient. Structural, same as Reformer.
+  - Hash-boundary instability: a small input perturbation near a
+    hyperplane can flip bucket assignment. Mitigated but not eliminated
+    by multi-round hashing (see false-negative rate above).
+  - torch.topk tie-breaking among equal scores is stable within one run
+    but not guaranteed bit-identical across CPU/GPU or GPU architectures.
+    Affects exact reproducibility only, never correctness.
+  - FP16/BF16 small-probability underflow on the softmax cast-back when
+    fp32_attn_weights=False (default) — standard behavior shared by most
+    FP16 attention kernels including FlashAttention.
+  - Gather temporary (B*H, N*K, d) materializes in PyTorch; true
+    bandwidth-optimal tiling needs a custom Triton/CUDA kernel.
 """
 
 from __future__ import annotations
@@ -154,6 +203,28 @@ class LSHGraphBuilder(nn.Module):
     def __init__(self, d_head: int, num_hashes: int, lsh_candidates: int,
                  num_rounds: int = 1):
         super().__init__()
+        # Guard against unbounded bucket-table memory. _single_round
+        # allocates two (BH, 2^num_hashes) int64 tables (bstart, bsize)
+        # every forward call. This is cheap at the intended range
+        # (num_hashes=8 → 256 buckets/round → ~0.3MB at BH=64) but scales
+        # as O(2^num_hashes), not O(num_hashes): at num_hashes=20 the same
+        # two tables cost ~1GB; at 24, ~17GB. There is also no benefit to
+        # num_hashes beyond ~log2(N) — once buckets outnumber tokens, most
+        # buckets are empty and routing degenerates to the empty-bucket
+        # fallback. 12 bits (4096 buckets/round) comfortably covers any
+        # practical N (>1 bucket/token up to N=4096 per round, and union
+        # across rounds extends useful coverage further) while keeping the
+        # bucket tables under ~5MB even at large BH.
+        assert num_hashes <= 12, (
+            f"num_hashes={num_hashes} would allocate 2**{num_hashes}="
+            f"{2**num_hashes:,} buckets per round per (batch,head) slice — "
+            f"this scales as O(2^num_hashes) and becomes impractically "
+            f"large well before this point (e.g. num_hashes=20 costs ~1GB "
+            f"just for bucket bookkeeping at BH=64). If you need finer "
+            f"routing than 12 bits provides, increase num_hash_rounds "
+            f"instead (linear cost) rather than num_hashes (exponential "
+            f"cost) — see LSHGraphBuilder docstring."
+        )
         self.P = num_hashes
         self.C = lsh_candidates          # candidates kept PER ROUND before union
         self.R = num_rounds
@@ -192,6 +263,17 @@ class LSHGraphBuilder(nn.Module):
              SparseAttention docstring). Running the hash projection in
              FP32 removes the *additional* precision-induced instability on
              top of the structural one, which is the cheap part to fix.
+
+        Integer overflow note: bucket ids are built as
+        `(bits * powers).sum(-1)` where `powers = 2**arange(P)`, computed in
+        default int64. This is safe for any P enforced by the num_hashes<=12
+        assert in __init__ (max bucket id 2^12=4096, far below int64
+        range). It would only become a real concern if that guard were
+        ever bypassed at P>=63 (int64 sign bit) — not reachable through the
+        public SSAConfig/LSHGraphBuilder API as written, but noted here
+        since the failure mode (silent wraparound rather than a clean
+        error) would be confusing to debug if this function were ever
+        modified to accept unbounded P.
         """
         proj   = x.float() @ self.rand_proj[round_idx].T   # FP32 regardless of x.dtype
         bits   = (proj > 0).long()
@@ -355,14 +437,45 @@ class LSHGraphBuilder(nn.Module):
         # *within* a single run on a given device, but is not guaranteed to
         # match bit-for-bit across CPU vs GPU or across different GPU
         # architectures/cuDNN versions. This affects exact reproducibility
-        # of which masked slot gets selected (it never affects correctness,
-        # since all genuinely tied real candidates are valid choices and all
-        # -inf slots are filtered/zeroed downstream) — not worth working
-        # around with a manual stable-sort tiebreak unless bit-exact
-        # cross-device reproducibility is a hard requirement.
+        # of which masked slot gets selected — not worth working around
+        # with a manual stable-sort tiebreak unless bit-exact cross-device
+        # reproducibility is a hard requirement.
         actual_k = min(top_k, Call)
-        _, best  = scores.topk(actual_k, dim=-1)
+        best_scores, best = scores.topk(actual_k, dim=-1)
         result   = torch.gather(all_cand, -1, best)
+
+        # ── BUG FIX (invalid slots resolving to a duplicated real key) ───
+        # When a query's true valid-candidate count is smaller than
+        # actual_k (e.g. a tiny bucket with C=64 requested but only 1 real
+        # member), topk is still forced to return actual_k positions and
+        # necessarily fills the rest from -inf-scored slots. Those slots'
+        # cand_pos was clamped into the gather's valid range purely to keep
+        # indexing in-bounds (see `_single_round`), which meant every
+        # invalid slot silently carried the SAME real key index forward
+        # (the clamp target) — e.g. one bucket member observed repeated 63
+        # times in `result` despite being masked invalid. The mask
+        # correctly prevented it from being preferred by score, but did not
+        # prevent it from being copied into the output once forced into a
+        # selected slot.
+        #
+        # Downstream `merge_neighbors` does deduplicate across all sources,
+        # so this never produced NaN or out-of-range indices — but it
+        # silently wasted neighbor-budget slots on a duplicated token
+        # instead of falling back to something independently useful (the
+        # global tokens), and relied on a different module to clean up
+        # after it. Fixed at the source: any selected slot whose score is
+        # -inf (i.e. invalid) is overwritten with a global-token index
+        # instead of whatever real key the clamp happened to land on.
+        invalid_selected = torch.isneginf(best_scores)          # (BH, N, actual_k)
+        if invalid_selected.any():
+            G = glob_fallback.shape[0]
+            fb = glob_fallback.view(1, 1, G).expand(BH, N, G)
+            if G >= actual_k:
+                fb = fb[..., :actual_k]
+            else:
+                pad = torch.zeros(BH, N, actual_k - G, dtype=torch.long, device=device)
+                fb  = torch.cat([fb, pad], dim=-1)
+            result = torch.where(invalid_selected, fb, result)
 
         return result.view(B, H, N, actual_k)
 
