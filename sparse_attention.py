@@ -71,6 +71,13 @@ class SSAConfig:
     num_global_tokens: int   = 2     # key tokens seen by all queries
     dropout:           float = 0.0
     causal:            bool  = False
+    fp32_attn_weights: bool  = False  # keep post-softmax weights in FP32
+                                       # through value aggregation instead of
+                                       # casting to model dtype first; avoids
+                                       # small-probability rounding to 0 under
+                                       # FP16/BF16 at the cost of 2x memory/
+                                       # bandwidth on the attn/v_gathered
+                                       # tensors. Off by default.
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -150,17 +157,43 @@ class LSHGraphBuilder(nn.Module):
         self.P = num_hashes
         self.C = lsh_candidates          # candidates kept PER ROUND before union
         self.R = num_rounds
-        # Independent random projection per round
+        # Independent random projection per round. Registered in FP32
+        # regardless of model dtype — hashing is a routing decision, not a
+        # learned computation, so there's no benefit to running it in
+        # reduced precision, and FP32 avoids the dtype-mismatch crash that
+        # occurs if the model is later cast to FP16/BF16 (see `_hash`).
         projs = []
         for r in range(num_rounds):
             p = torch.randn(num_hashes, d_head)
-            p = p / p.norm(dim=-1, keepdim=True)
+            # clamp_min guards against a zero-norm row. A genuinely-zero
+            # Gaussian vector has probability 0 in theory, but clamp_min
+            # is one line and removes a NaN risk for free — no reason to
+            # rely on "effectively impossible" when avoiding it is free.
+            p = p / p.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             projs.append(p)
-        self.register_buffer("rand_proj", torch.stack(projs))  # (R, P, d)
+        self.register_buffer("rand_proj", torch.stack(projs))  # (R, P, d), always fp32
 
     def _hash(self, x: torch.Tensor, round_idx: int) -> torch.Tensor:
-        """x: (..., d) → bucket id (...) in [0, 2^P), using round `round_idx`."""
-        proj   = x @ self.rand_proj[round_idx].T
+        """
+        x: (..., d) → bucket id (...) in [0, 2^P), using round `round_idx`.
+
+        Hashing is always done in FP32 regardless of the input dtype. This
+        matters for two reasons:
+          1. Correctness: rand_proj is registered as FP32 (see __init__).
+             Without an explicit cast, x.dtype=FP16 against an FP32 buffer
+             raises a dtype-mismatch error in matmul — this used to crash
+             outright under FP16/BF16 training/inference.
+          2. Precision: bucket assignment is a sign test (`proj > 0`). Near
+             a hyperplane boundary the FP16 rounding error itself can flip
+             the sign vs. what FP32 would compute, on top of the inherent
+             hyperplane-boundary instability that's already there in FP32
+             (small input perturbations always change bucket assignment
+             near the boundary — this is structural to LSH, not a bug; see
+             SparseAttention docstring). Running the hash projection in
+             FP32 removes the *additional* precision-induced instability on
+             top of the structural one, which is the cheap part to fix.
+        """
+        proj   = x.float() @ self.rand_proj[round_idx].T   # FP32 regardless of x.dtype
         bits   = (proj > 0).long()
         powers = 2 ** torch.arange(self.P, device=x.device)
         return (bits * powers).sum(-1)
@@ -315,6 +348,18 @@ class LSHGraphBuilder(nn.Module):
         scores = scores.masked_fill(~all_valid, float("-inf"))
 
         # ── top-k over the deduplicated, validity-masked union ───────────
+        # Tie-breaking note: when many candidates share the same score
+        # (most commonly -inf from masked-out overflow/empty-bucket slots,
+        # occasionally genuine ties between real dot products), torch.topk's
+        # choice among tied entries is implementation-defined. It is stable
+        # *within* a single run on a given device, but is not guaranteed to
+        # match bit-for-bit across CPU vs GPU or across different GPU
+        # architectures/cuDNN versions. This affects exact reproducibility
+        # of which masked slot gets selected (it never affects correctness,
+        # since all genuinely tied real candidates are valid choices and all
+        # -inf slots are filtered/zeroed downstream) — not worth working
+        # around with a manual stable-sort tiebreak unless bit-exact
+        # cross-device reproducibility is a hard requirement.
         actual_k = min(top_k, Call)
         _, best  = scores.topk(actual_k, dim=-1)
         result   = torch.gather(all_cand, -1, best)
@@ -421,6 +466,7 @@ def sparse_gather_attention(
     scale:     float,
     dropout:   float = 0.0,
     training:  bool  = False,
+    fp32_attn_weights: bool = False,
 ) -> torch.Tensor:
     """
     Gather K neighbors per query then attend.
@@ -428,6 +474,16 @@ def sparse_gather_attention(
 
     Gather via (B*H, N*K) index into (B*H, M, d) avoids any (N,M,d) expand.
     The index tensor (B*H, N*K, d) is O(NKd), same order as k_nb itself.
+
+    fp32_attn_weights: if True, keep post-softmax attention weights in FP32
+    through the value-aggregation einsum instead of casting down to the
+    model dtype first. Costs more memory/bandwidth for that einsum (attn
+    and v_gathered both run at 2x size under FP16/BF16) in exchange for
+    not rounding small attention probabilities to 0 before they multiply
+    into V, which can slightly improve gradient quality in FP16/BF16
+    training. Off by default — the effect is normally below the training
+    noise floor; enable for ablations or observed instability that traces
+    back to this rounding.
     """
     B, H, N, d = q.shape
     K           = neighbors.shape[-1]
@@ -452,12 +508,41 @@ def sparse_gather_attention(
     scores = torch.einsum('bhnd,bhnkd->bhnk',
                           q.float(), k_gathered.float()) * scale  # (B,H,N,K)
 
-    attn = F.softmax(scores, dim=-1).to(q.dtype)             # (B,H,N,K)
+    # Softmax always runs in FP32 for numerical stability, regardless of
+    # model dtype or fp32_attn_weights.
+    attn = F.softmax(scores, dim=-1)                          # (B,H,N,K), FP32
+
+    if fp32_attn_weights:
+        # Keep FP32 all the way through the value-aggregation einsum.
+        # v_gathered is upcast to match — costs 2x memory/bandwidth on
+        # both tensors relative to the default path below.
+        v_for_agg = v_gathered.float()
+    else:
+        # Cast attn down to V's dtype — not Q's dtype. attn is about to be
+        # multiplied against v_gathered in the einsum below, so the cast
+        # should match what it's being multiplied against. Casting to
+        # q.dtype was a latent bug: harmless today since q/k/v always share
+        # one model dtype in this codebase, but incorrect by construction —
+        # if a future mixed-precision scheme ever gave q and v different
+        # dtypes, casting attn to q.dtype right before a matmul with v
+        # would be the wrong reference type.
+        #
+        # Side effect under FP16/BF16: very small post-softmax
+        # probabilities (e.g. <6e-5 in FP16) round to exact 0 on this cast,
+        # slightly increasing effective sparsity beyond what neighbor
+        # selection alone provides. Standard behavior shared by most FP16
+        # attention kernels (including FlashAttention); set
+        # fp32_attn_weights=True to avoid it.
+        attn = attn.to(v_gathered.dtype)
+        v_for_agg = v_gathered
+
     if dropout > 0.0 and training:
         attn = F.dropout(attn, p=dropout)
 
-    # einsum for output aggregation — same reason
-    return torch.einsum('bhnk,bhnkd->bhnd', attn, v_gathered)  # (B,H,N,d)
+    # einsum for output aggregation — same reason as scores (avoids the
+    # (B,H,N,K,d) multiply-then-sum materialisation spike).
+    out = torch.einsum('bhnk,bhnkd->bhnd', attn, v_for_agg)   # (B,H,N,d)
+    return out.to(q.dtype) if fp32_attn_weights else out
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -518,6 +603,25 @@ class SparseAttention(nn.Module):
         x:         torch.Tensor,
         key_value: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
+        """
+        Precision note (QKV projection dtype): Wq/Wk/Wv run in whatever
+        dtype `x` arrives in (FP32/FP16/BF16). Attention scores and the LSH
+        hash projection are explicitly upcast to FP32 internally (see
+        `sparse_gather_attention` and `LSHGraphBuilder._hash`), but the
+        projection matmuls themselves are NOT forced to FP32 here.
+
+        This is intentional, not an oversight: forcing FP32 projections
+        inside the module would silently defeat the memory/speed reasons
+        for using FP16/BF16 in the first place, and conflicts with how
+        mixed-precision training is normally done. The correct way to
+        avoid FP16 projection overflow is `torch.autocast` around the
+        whole forward pass — autocast keeps matmul *reductions* in FP32
+        internally even when inputs/outputs are FP16, which this module
+        does not have visibility into or control over from inside. If you
+        are training in raw FP16 without autocast, overflow risk in Wq/Wk/Wv
+        is a property of that choice, common to every nn.Linear layer in
+        the model, not specific to this attention implementation.
+        """
 
         B, N, _ = x.shape
         is_cross = key_value is not None
@@ -559,6 +663,7 @@ class SparseAttention(nn.Module):
             scale    = self.scale,
             dropout  = self.dp,
             training = self.training,
+            fp32_attn_weights = self.config.fp32_attn_weights,
         )
 
         peak_sparse = B * self.H * N * self.K * self.d_head
