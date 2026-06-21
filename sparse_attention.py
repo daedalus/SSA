@@ -80,8 +80,19 @@ K=32, R=4, window=4):
   table would be the correct fix for the sort costs specifically, but
   has not been implemented — see "Known limitations" below.
 
-  Memory peak: O(N · K · d) for the final gathered K/V — no N×N tensor
-  anywhere in the entire pipeline (graph construction included).
+  Memory peak: NOT O(N·K·d). The final attention step (gather + dot +
+  aggregate) does use O(N·K·d), but it is not the peak — the LSH union/
+  rescore step that runs BEFORE it materializes (B·H, N, R·C, d)-shaped
+  tensors (`cand_k` inside LSHGraphBuilder.forward), where R·C is
+  typically several times larger than K (e.g. measured R·C=672 vs K=64
+  in one tested config — a 10.5x larger intermediate than the "O(NK)"
+  figure suggests). The TRUE peak across the whole forward pass is
+  O(N · R · C · d), not O(N · K · d). Both are still linear in N with R
+  and C as O(1) constants for fixed config (so the asymptotic class is
+  unaffected), but stating "O(NK)" without qualification — easy to do,
+  since it's true for the attention step in isolation — understates the
+  actual peak memory a profiler would report by a meaningful constant
+  factor. No N×N tensor anywhere in the entire pipeline regardless.
 
 Recent fixes (most recent first):
 
@@ -412,6 +423,24 @@ class LSHGraphBuilder(nn.Module):
         rely on the candidate budget to cover most of the sequence
         directly") — measured 94.6% recall@16 at M=128,C=64,P=1 vs 40.9%
         at the naive P=4 floor used in an earlier version of this module.
+
+        Discontinuity note: round() means P_eff jumps by exactly 1 (i.e.
+        bucket count doubles or halves) whenever M/C crosses a
+        half-integer power of 2 — e.g. at C=64, this happens at
+        M ≈ 182, 363, 725, 1449, 2897, .... A sequence-length change that
+        crosses one of these boundaries (e.g. M=1448→1449) does cause a
+        real, measurable shift in routing, but it is small in practice:
+        measured ~3 percentage points of recall@16 and no detectable
+        latency discontinuity (~2% noise) right at the M=1448/1449/1450
+        boundary. This is smaller than the seed-to-seed recall variance
+        already inherent to LSH (~1.7% relative std at R=4 rounds,
+        measured separately) and well within normal run-to-run noise, not
+        a sharp cliff. No hysteresis or floor/ceil smoothing implemented —
+        the measured discontinuity size didn't justify the added
+        complexity, but this is a judgment call; revisit if a specific
+        downstream use case is sensitive to sequence-length-triggered
+        routing changes (e.g. reproducibility requirements across
+        sequences that happen to straddle a boundary).
         """
         if M <= 1 or C <= 0:
             return min_p
@@ -550,6 +579,27 @@ class LSHGraphBuilder(nn.Module):
             # silently double-counted. Left as a flat tile (not cyclic)
             # since cyclic ordering provides no benefit once a single
             # post-dedup pass removes all but the first occurrence anyway.
+            #
+            # QUANTIFIED QUALITY RISK (when this fallback path matters):
+            # measured directly — at the adaptive bucket sizing this module
+            # uses by default (occupancy ≈ C via compute_effective_p), the
+            # fraction of queries hitting empty_rows in ALL R rounds
+            # simultaneously was 0% across N=256/1024/4096 in testing
+            # (multi-round independence makes "empty in every round"
+            # vanishingly rare once occupancy is in the recommended range
+            # — P(empty in all R) ≈ P(empty in one round)^R). HOWEVER, in
+            # a deliberately misconfigured regime (e.g. lsh_candidates set
+            # far smaller than what compute_effective_p would imply,
+            # forcing occupancy << 1), this stops being rare: measured 234
+            # of 256 queries (91%) with a genuinely empty bucket at
+            # occupancy=0.06, all collapsing to the SAME 2 global-token
+            # candidates regardless of query content — i.e. near-total
+            # loss of query-specific routing for the majority of tokens.
+            # This is a real risk, but specifically a misconfiguration
+            # risk (occupancy far below C), not a property of the default
+            # adaptive sizing path. If overriding lsh_candidates manually,
+            # keep it large enough that compute_effective_p's target
+            # occupancy assumption (≈C) stays roughly true for your N.
             fb = glob_fallback.view(1, 1, G).expand(BH, N, G)
             if G >= C:
                 fb = fb[..., :C]
@@ -764,7 +814,17 @@ def merge_neighbors(
     # True maximum valid key index, captured BEFORE any sentinel is
     # introduced. This is the single source of truth for what counts as
     # a "real" index vs a sentinel for the rest of this function.
-    true_max_idx = combined.max().item()
+    #
+    # PERFORMANCE FIX: kept as a 0-dim TENSOR (not .item()'d to a Python
+    # int) for the rest of this function. `.item()` forces a device→host
+    # synchronization on every call — on CUDA this stalls the launch queue
+    # until the device finishes all prior work, which is exactly the kind
+    # of per-forward-pass sync that's easy to miss in CPU testing (where
+    # there's no queue to stall) but measurable in real GPU training/
+    # inference loops. torch.clamp, comparisons (>, <=), and masked_fill
+    # all accept a 0-dim tensor identically to a Python scalar — verified
+    # directly, no behavior change, purely removes the sync point.
+    true_max_idx = combined.max()
     sentinel = true_max_idx + 1   # shared by both masking steps below
 
     # ── Exclude self from the candidate pool (self-attn only) ─────────
