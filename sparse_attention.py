@@ -47,29 +47,54 @@ MEASURED WALL-CLOCK BREAKDOWN (not just asymptotic — this is what
 actually dominates runtime in practice, CPU, single core, N=32768,
 K=32, R=4, window=4):
 
-    Per-round bucket sort (×4 rounds):         670 ms  (16.5%)
-    Cross-round dedup sort:                    770 ms  (19.0%)
-    Rescore gather (index_select):           1,502 ms  (37.0%)
-    merge_neighbors (window+global dedup):     130 ms  ( 3.2%)
-    Actual sparse attention (gather+dot+agg):  411 ms  (10.1%)
+    Per-round bucket sort (×4 rounds):         670 ms  (14.6%)
+    Cross-round dedup sort:                    770 ms  (16.8%)
+    merge_neighbors internal sorts:             52 ms  ( 1.1%)
+    merge_neighbors (rest: gather/scatter):     78 ms  ( 1.7%)
+    Rescore gather (index_select):           1,502 ms  (32.7%)
+    Actual sparse attention (gather+dot+agg):  411 ms  ( 9.0%)
     ──────────────────────────────────────────────────────────
-    Total forward pass:                      4,588 ms
+    Total forward pass:                      4,588 ms  (the rest, ~23%,
+                                              is Q/K/V projections, output
+                                              projection, and Python/
+                                              dispatch overhead not broken
+                                              out above)
 
-  LSH graph construction (sort + dedup + gather) is ~91% of wall-clock
-  time at this scale; the O(NKd) attention step the architecture is
-  named for is ~10%. "Attention is O(NK)" is asymptotically true and
-  practically misleading taken alone — the bottleneck at long context is
-  graph construction, not attention, and that bottleneck is itself
-  dominated by a memory-bandwidth-bound gather (index_select scatter-read
-  pattern), not by FLOPs. Measured: this gather achieves ~1.7 GB/s on a
-  single CPU core regardless of whether access is random or sequential
-  (1.1x difference between the two), consistent with a bandwidth bound
-  rather than a cache-locality bound specifically. On GPU (HBM bandwidth
-  2-8 TB/s vs this sandbox's single-core ~GB/s) the absolute numbers
-  would differ by orders of magnitude, but the structural conclusion —
-  this op moves a lot of memory relative to its FLOP count, so it WILL
-  be bandwidth-bound somewhere — should transfer. Not independently
-  verified on GPU; this codebase has only been profiled on CPU.
+  CROSS-CUTTING VIEW (sorting appears at 3 separate call sites — per-round
+  bucket construction, cross-round dedup, and inside merge_neighbors —
+  easy to undercount if read as 3 separate "minor" costs rather than one
+  recurring operation):
+
+    ALL torch.sort() calls combined:         1,492 ms  (32.5%)
+    The rescore gather alone:                1,502 ms  (32.7%)
+
+  These two are effectively tied as the dominant cost, each roughly 3.6x
+  the actual attention step (411ms, 9.0%). LSH graph construction as a
+  whole (all sorts + the gather + merge_neighbors overhead) is ~91% of
+  wall-clock time at this scale; the O(NKd) attention step the
+  architecture is named for is ~9%. "Attention is O(NK)" is
+  asymptotically true and practically misleading taken alone — the
+  bottleneck at long context is graph construction, split roughly evenly
+  between sort-dominated and gather-dominated costs, neither of which
+  is FLOP-bound. The gather is memory-bandwidth-bound (measured ~1.7
+  GB/s on a single CPU core regardless of whether access is random or
+  sequential — 1.1x difference between the two — consistent with a
+  bandwidth bound, not a cache-locality bound specifically). The sorts
+  are a mix of genuine O(M log M) algorithmic cost and PyTorch's
+  CPU sort implementation constant factor, which has not been profiled
+  against alternative sort algorithms (radix sort would likely be
+  faster for the small fixed-width integer keys used here, but is not
+  implemented). On GPU (HBM bandwidth 2-8 TB/s vs this sandbox's
+  single-core ~GB/s) the absolute numbers would differ by orders of
+  magnitude, but the structural conclusion — these ops move a lot of
+  memory and do comparatively little compute, so they WILL be
+  bandwidth/sort-bound somewhere, just at a different scale — should
+  transfer. Not independently verified on GPU; this codebase has only
+  been profiled on CPU, and that remains the single largest gap before
+  any production claim (A100/H100 benchmarks, FlashAttention-2
+  comparison, and a Triton bucket-construction kernel would all be
+  required before this implementation could honestly be compared
+  against production sparse-attention systems).
 
   The single largest fixed-config lever for reducing this overhead is
   the LSH candidate oversample factor (C = lsh_k * 4): reducing it
