@@ -196,6 +196,14 @@ import torch.nn.functional as F
 class SSAConfig:
     d_model:           int   = 512
     num_heads:         int   = 8
+    # GQA / MQA: set num_kv_heads < num_heads for grouped/multi-query attention.
+    # num_heads must be divisible by num_kv_heads.  Default None means full MHA
+    # (num_kv_heads == num_heads).  Each KV head is shared across
+    # (num_heads // num_kv_heads) query heads, matching the LLaMA-2/Mistral
+    # convention.  d_kv_head == d_model // num_heads (key/value head dim is
+    # kept equal to query head dim so the same LSH projections work; only the
+    # number of independent KV projections changes).
+    num_kv_heads:      Optional[int] = None
     num_neighbors:     int   = 64    # K: neighbor slots per token
     max_num_hashes:    int   = 12    # CEILING on LSH planes/round (2^P buckets).
                                        # The actual P used per forward call is
@@ -217,7 +225,23 @@ class SSAConfig:
                                        #  empirically ~9% at 1 round → ~0% at 4,
                                        #  see test_multi_round_lsh.py)
     window_size:       int   = 16    # local window half-width
-    num_global_tokens: int   = 2     # key tokens seen by all queries
+    num_global_tokens: int   = 2     # key tokens seen by all queries.
+                                       # Governs the DEFAULT behaviour (first G
+                                       # tokens) when global_token_indices is
+                                       # None.  Ignored when
+                                       # global_token_indices is set explicitly.
+    global_token_indices: Optional[list] = None
+                                       # Explicit list of key positions that
+                                       # every query attends to, e.g. [0, 1]
+                                       # for BOS+CLS, or [0, 128, 256] for
+                                       # evenly-spaced landmarks.  When set,
+                                       # overrides num_global_tokens entirely.
+                                       # Indices are clamped to [0, M-1] at
+                                       # runtime so out-of-range values are
+                                       # safe (but wasteful).  Use this instead
+                                       # of num_global_tokens whenever your
+                                       # global tokens are NOT the leading
+                                       # positions of the key sequence.
     dropout:           float = 0.0
     causal:            bool  = False
     fp32_attn_weights: bool  = False  # keep post-softmax weights in FP32
@@ -326,12 +350,36 @@ class WindowGraphBuilder(nn.Module):
 # ────────────────────────────────────────────────────────────────────────────
 
 class GlobalGraphBuilder(nn.Module):
-    """First G key tokens are attended by every query."""
-    def __init__(self, num_global: int):
+    """
+    Key tokens attended by every query.
+
+    Two modes (controlled by SSAConfig):
+      - indices=None  -> first G tokens, i.e. torch.arange(G).  Default,
+                         matches the original behaviour.
+      - indices=[...] -> explicit list of key positions.  Allows BOS/CLS at
+                         position 0, mid-sequence landmarks, or any other
+                         non-contiguous set.  Positions are clamped to
+                         [0, M-1] at runtime so stale indices from a longer
+                         sequence never go out of range.
+    """
+    def __init__(self, num_global: int, indices: Optional[list] = None):
         super().__init__()
-        self.G = num_global
+        if indices is not None:
+            self.register_buffer(
+                "_fixed_idx",
+                torch.tensor(indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.G = len(indices)
+            self._use_fixed = True
+        else:
+            self.G = num_global
+            self._use_fixed = False
 
     def forward(self, M: int, device) -> torch.Tensor:
+        if self._use_fixed:
+            idx = self._fixed_idx.to(device)
+            return idx.clamp(0, M - 1)           # (G,) safe for any M
         return torch.arange(min(self.G, M), device=device)  # (G,)
 
 
@@ -1027,30 +1075,56 @@ class SparseAttention(nn.Module):
 
     def __init__(self, config: SSAConfig):
         super().__init__()
-        assert config.d_model % config.num_heads == 0
-        self.config = config
-        self.H      = config.num_heads
-        self.d_head = config.d_model // config.num_heads
-        self.K      = config.num_neighbors
-        self.scale  = self.d_head ** -0.5
+        import warnings
 
-        self.Wq = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.Wk = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.Wv = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.Wo = nn.Linear(config.d_model, config.d_model, bias=False)
+        assert config.d_model % config.num_heads == 0, \
+            f"d_model ({config.d_model}) must be divisible by num_heads ({config.num_heads})"
+
+        # -- GQA / MQA -------------------------------------------------------
+        # num_kv_heads=None  -> standard MHA (num_kv_heads == num_heads)
+        # num_kv_heads=1     -> MQA (single shared KV head)
+        # 1 < num_kv_heads < num_heads -> GQA (LLaMA-2 / Mistral style)
+        #
+        # Wk/Wv project to (num_kv_heads * d_head) instead of d_model.
+        # In forward(), each KV head is expanded to serve
+        # (num_heads // num_kv_heads) query heads via repeat_interleave
+        # before being passed to merge_neighbors / sparse_gather_attention,
+        # which always operate in the full (B, H, ...) space.
+        n_kv = config.num_kv_heads if config.num_kv_heads is not None else config.num_heads
+        assert config.num_heads % n_kv == 0, \
+            f"num_heads ({config.num_heads}) must be divisible by num_kv_heads ({n_kv})"
+
+        self.config   = config
+        self.H        = config.num_heads
+        self.n_kv     = n_kv
+        self.kv_rep   = config.num_heads // n_kv   # expansion factor (1 for MHA)
+        self.d_head   = config.d_model // config.num_heads
+        self.K        = config.num_neighbors
+        self.scale    = self.d_head ** -0.5
+
+        self.Wq = nn.Linear(config.d_model, config.num_heads * self.d_head, bias=False)
+        self.Wk = nn.Linear(config.d_model, n_kv             * self.d_head, bias=False)
+        self.Wv = nn.Linear(config.d_model, n_kv             * self.d_head, bias=False)
+        self.Wo = nn.Linear(config.num_heads * self.d_head, config.d_model, bias=False)
 
         self.win_builder  = WindowGraphBuilder(config.window_size, config.causal)
-        self.glob_builder = GlobalGraphBuilder(config.num_global_tokens)
+        self.glob_builder = GlobalGraphBuilder(
+            num_global = config.num_global_tokens,
+            indices    = config.global_token_indices,
+        )
 
-        guaranteed = 2 * config.window_size + 1 + config.num_global_tokens + 1
+        n_glob     = (len(config.global_token_indices)
+                      if config.global_token_indices is not None
+                      else config.num_global_tokens)
+        guaranteed = 2 * config.window_size + 1 + n_glob + 1
         self.lsh_k = max(self.K - guaranteed, 8)
 
-        # Efficiency note (not a correctness issue — see merge_neighbors'
+        # Efficiency note (not a correctness issue -- see merge_neighbors'
         # `valid` mask, which makes oversized/wasted candidate budgets
         # harmless to the output): when window_size and num_global_tokens
         # are large relative to num_neighbors, the raw candidate pool
         # (window + global + self + lsh_k) can substantially exceed K
-        # before truncation/dedup. E.g. K=16, window_size=16 →
+        # before truncation/dedup. E.g. K=16, window_size=16 ->
         # guaranteed=36 already exceeds K, lsh_k floors at 8, and the raw
         # pool (33+2+1+8=44) is ~2.8x what's actually kept. This wastes
         # compute (LSH still does real work for candidates that get
@@ -1059,7 +1133,6 @@ class SparseAttention(nn.Module):
         # `2*window_size+1 + num_global_tokens + 1` stays comfortably
         # below K.
         if guaranteed > self.K:
-            import warnings
             warnings.warn(
                 f"SSAConfig: window+global+self budget ({guaranteed}) exceeds "
                 f"num_neighbors ({self.K}). lsh_k is floored at 8 and a large "
@@ -1077,9 +1150,26 @@ class SparseAttention(nn.Module):
         )
         self.dp = config.dropout
 
-    def _split(self, x):
+    def _split_q(self, x):
+        """Split query projection: (B,N,H*d) -> (B,H,N,d)"""
         B, N, _ = x.shape
         return x.view(B, N, self.H, self.d_head).transpose(1, 2)
+
+    def _split_kv(self, x):
+        """Split KV projection: (B,M,n_kv*d) -> (B,H,M,d) with GQA expansion."""
+        B, M, _ = x.shape
+        # (B, M, n_kv, d_head) -> (B, n_kv, M, d)
+        kv = x.view(B, M, self.n_kv, self.d_head).transpose(1, 2)
+        if self.kv_rep > 1:
+            # Expand to (B, H, M, d) by repeating each KV head kv_rep times.
+            # repeat_interleave keeps head-group ordering consistent with how
+            # query heads are split (head 0..kv_rep-1 share KV head 0, etc.)
+            kv = kv.repeat_interleave(self.kv_rep, dim=1)
+        return kv  # (B, H, M, d)
+
+    # _split kept as alias so existing callers of _split(q) still work
+    def _split(self, x):
+        return self._split_q(x)
 
     def _merge(self, x):
         B, H, N, _ = x.shape
@@ -1087,10 +1177,29 @@ class SparseAttention(nn.Module):
 
     def forward(
         self,
-        x:         torch.Tensor,
-        key_value: Optional[torch.Tensor] = None,
+        x:              torch.Tensor,
+        key_value:      Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        return_stats:   bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
+        Args:
+            x:              Query input  (B, N, d_model).
+            key_value:      Key/value source for cross-attention (B, M, d_model).
+                            None means self-attention.
+            attention_mask: MUST be None.  Sparse attention does not support
+                            dense external masks — the graph already encodes
+                            causality (config.causal=True) and cross-attention
+                            padding (global/LSH fallback).  Passing a mask here
+                            raises ValueError so callers get an explicit error
+                            rather than the mask being silently ignored.
+                            If you need to mark padding tokens, set those
+                            positions to 0 in `x` before calling forward().
+            return_stats:   If True, return (output, stats_dict).
+                            If False (default), return (output, {}) — the empty
+                            dict keeps the two-tuple contract without forcing
+                            callers to unpack a dict they don't need.
+
         Precision note (QKV projection dtype): Wq/Wk/Wv run in whatever
         dtype `x` arrives in (FP32/FP16/BF16). Attention scores and the LSH
         hash projection are explicitly upcast to FP32 internally (see
@@ -1102,13 +1211,26 @@ class SparseAttention(nn.Module):
         for using FP16/BF16 in the first place, and conflicts with how
         mixed-precision training is normally done. The correct way to
         avoid FP16 projection overflow is `torch.autocast` around the
-        whole forward pass — autocast keeps matmul *reductions* in FP32
+        whole forward pass -- autocast keeps matmul *reductions* in FP32
         internally even when inputs/outputs are FP16, which this module
         does not have visibility into or control over from inside. If you
         are training in raw FP16 without autocast, overflow risk in Wq/Wk/Wv
         is a property of that choice, common to every nn.Linear layer in
         the model, not specific to this attention implementation.
         """
+
+        # -- Causal-mask guard -----------------------------------------------
+        # Dense external masks are incompatible with sparse neighbor graphs.
+        # Raise early with an actionable message instead of silently ignoring.
+        if attention_mask is not None:
+            raise ValueError(
+                "SparseAttention does not accept an external attention_mask. "
+                "Use config.causal=True for autoregressive masking (handled "
+                "internally by WindowGraphBuilder and LSHGraphBuilder). "
+                "For padding, zero out padding positions in x before calling "
+                "forward(), or set num_global_tokens to 0 so padding tokens "
+                "are not forced into every query's neighbor set."
+            )
 
         B, N, _ = x.shape
         is_cross = key_value is not None
@@ -1117,9 +1239,9 @@ class SparseAttention(nn.Module):
         device   = x.device
         causal   = self.config.causal and not is_cross  # never causal for cross-attn
 
-        q = self._split(self.Wq(x))
-        k = self._split(self.Wk(src))
-        v = self._split(self.Wv(src))
+        q = self._split_q(self.Wq(x))
+        k = self._split_kv(self.Wk(src))   # GQA expansion happens here
+        v = self._split_kv(self.Wv(src))
 
         # Graph components
         glob_idx = self.glob_builder(M, device)        # (G,)
@@ -1175,6 +1297,11 @@ class SparseAttention(nn.Module):
             fp32_attn_weights = self.config.fp32_attn_weights,
         )
 
+        out_proj = self.Wo(self._merge(out))
+
+        if not return_stats:
+            return out_proj, {}
+
         peak_sparse = B * self.H * N * self.K * self.d_head
         peak_full   = B * self.H * N * M * self.d_head
         stats = {
@@ -1185,11 +1312,11 @@ class SparseAttention(nn.Module):
             # Fraction of neighbor slots that were padding (no real
             # neighbor after dedup), averaged over all tokens/heads/batch.
             # High values mean num_neighbors (K) is set larger than the
-            # graph can usefully fill — informational only, doesn't affect
+            # graph can usefully fill -- informational only, does not affect
             # correctness now that padding is masked to -inf before softmax.
             "padding_fraction":  (~valid).float().mean().item(),
         }
-        return self.Wo(self._merge(out)), stats
+        return out_proj, stats
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1210,8 +1337,8 @@ class SparseTransformerLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d)
         self.norm2 = nn.LayerNorm(d)
 
-    def forward(self, x):
-        a, stats = self.attn(self.norm1(x))
+    def forward(self, x, return_stats: bool = False):
+        a, stats = self.attn(self.norm1(x), return_stats=return_stats)
         return x + a + self.ff(self.norm2(x + a)), stats
 
 
@@ -1222,12 +1349,12 @@ class SparseTransformer(nn.Module):
         self.layers = nn.ModuleList([SparseTransformerLayer(config) for _ in range(num_layers)])
         self.norm   = nn.LayerNorm(config.d_model)
 
-    def forward(self, x):
+    def forward(self, x, return_stats: bool = False):
         if self.embed is not None:
             x = self.embed(x)
         stats_list = []
         for layer in self.layers:
-            x, stats = layer(x)
+            x, stats = layer(x, return_stats=return_stats)
             stats_list.append(stats)
         return self.norm(x), stats_list
 
