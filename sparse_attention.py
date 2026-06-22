@@ -1175,6 +1175,101 @@ class SparseAttention(nn.Module):
         B, H, N, _ = x.shape
         return x.transpose(1, 2).contiguous().view(B, N, self.config.d_model)
 
+    def build_graph(
+        self,
+        q:        torch.Tensor,   # (B, H, N, d) -- already projected & split
+        k:        torch.Tensor,   # (B, H, M, d) -- already projected & split
+        N: int, M: int, B: int,
+        device,
+        causal:   bool,
+        is_cross: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Builds the sparse neighbor graph (window + global + LSH + self,
+        merged/deduped) without touching q/k/v values. Split out of
+        forward() specifically so the graph can be computed once and
+        reused across multiple SparseAttention instances/layers -- see
+        CachedGraphSparseTransformer below for the actual reuse path
+        (LSA-style Cross-Layer Indexing).
+
+        Returns (neighbors, valid), both (B, H, N, K) -- the same contract
+        `merge_neighbors` always returned, just no longer fused with
+        apply_graph so the two can be called independently or cached
+        between calls.
+        """
+        glob_idx = self.glob_builder(M, device)        # (G,)
+
+        # BUG FIX (cross-attention window graph was positionally meaningless):
+        # WindowGraphBuilder assumes query position i should attend keys near
+        # position i -- a reasonable locality prior for self-attention (N==M,
+        # same sequence), but meaningless for cross-attention, where query
+        # and key sequences are different things entirely (e.g. decoder
+        # tokens vs. encoder hidden states) and "position i" in one has no
+        # relationship to "position i" in the other. Verified directly: with
+        # N=8 decoder queries and M=64 encoder keys, every query's window
+        # clustered around the first ~16 of 64 key positions purely from the
+        # index-alignment assumption, never reaching most of the actual
+        # encoder output. Window neighbors are now skipped entirely for
+        # cross-attention; LSH (content-based, no positional assumption) and
+        # global tokens still provide full-sequence coverage. The window
+        # slots simply become unused budget (harmless now that padding is
+        # masked to -inf before softmax -- see merge_neighbors/
+        # sparse_gather_attention `valid` mask).
+        if is_cross:
+            win_idx = torch.zeros(N, 0, dtype=torch.long, device=device)  # (N, 0): no window contribution
+        else:
+            win_idx = self.win_builder(N, M, device)      # (N, 2w+1)
+
+        lsh_idx  = self.lsh_builder(
+            q, k,
+            top_k        = self.lsh_k,
+            causal       = causal,
+            glob_fallback= glob_idx,
+        )                                               # (B, H, N, lsh_k)
+
+        # Self-edge: only for self-attention
+        if not is_cross:
+            self_idx = torch.arange(N, device=device)                   # (N,)
+            self_idx = self_idx.view(1, 1, N).expand(B, self.H, N)      # (B,H,N)
+        else:
+            self_idx = None  # cross-attn: no self-edge
+
+        neighbors, valid = merge_neighbors(
+            win_idx, glob_idx, lsh_idx,
+            self_idx = self_idx,
+            total_k  = self.K,
+            N=N, B=B, H=self.H, device=device,
+        )
+        return neighbors, valid
+
+    def apply_graph(
+        self,
+        q:         torch.Tensor,   # (B, H, N, d)
+        k:         torch.Tensor,   # (B, H, M, d)
+        v:         torch.Tensor,   # (B, H, M, d)
+        neighbors: torch.Tensor,   # (B, H, N, K)
+        valid:     torch.Tensor,   # (B, H, N, K)
+    ) -> torch.Tensor:
+        """
+        Runs sparse_gather_attention against an already-built neighbor
+        graph. Split out of forward() so a cached graph (from a previous
+        layer, see CachedGraphSparseTransformer) can be applied to THIS
+        layer's q/k/v without recomputing window/global/LSH indices.
+
+        Caller is responsible for ensuring `neighbors`/`valid` shapes match
+        this layer's (B, H, N, K) -- if reusing across layers with
+        different d_head or K, this will shape-mismatch loudly rather than
+        silently producing wrong output.
+        """
+        return sparse_gather_attention(
+            q, k, v, neighbors,
+            scale    = self.scale,
+            valid    = valid,
+            dropout  = self.dp,
+            training = self.training,
+            fp32_attn_weights = self.config.fp32_attn_weights,
+        )
+
     def forward(
         self,
         x:              torch.Tensor,
@@ -1243,59 +1338,8 @@ class SparseAttention(nn.Module):
         k = self._split_kv(self.Wk(src))   # GQA expansion happens here
         v = self._split_kv(self.Wv(src))
 
-        # Graph components
-        glob_idx = self.glob_builder(M, device)        # (G,)
-
-        # BUG FIX (cross-attention window graph was positionally meaningless):
-        # WindowGraphBuilder assumes query position i should attend keys near
-        # position i — a reasonable locality prior for self-attention (N==M,
-        # same sequence), but meaningless for cross-attention, where query
-        # and key sequences are different things entirely (e.g. decoder
-        # tokens vs. encoder hidden states) and "position i" in one has no
-        # relationship to "position i" in the other. Verified directly: with
-        # N=8 decoder queries and M=64 encoder keys, every query's window
-        # clustered around the first ~16 of 64 key positions purely from the
-        # index-alignment assumption, never reaching most of the actual
-        # encoder output. Window neighbors are now skipped entirely for
-        # cross-attention; LSH (content-based, no positional assumption) and
-        # global tokens still provide full-sequence coverage. The window
-        # slots simply become unused budget (harmless now that padding is
-        # masked to -inf before softmax — see merge_neighbors/
-        # sparse_gather_attention `valid` mask).
-        if is_cross:
-            win_idx = torch.zeros(N, 0, dtype=torch.long, device=device)  # (N, 0): no window contribution
-        else:
-            win_idx = self.win_builder(N, M, device)      # (N, 2w+1)
-
-        lsh_idx  = self.lsh_builder(
-            q, k,
-            top_k        = self.lsh_k,
-            causal       = causal,
-            glob_fallback= glob_idx,
-        )                                               # (B, H, N, lsh_k)
-
-        # Self-edge: only for self-attention
-        if not is_cross:
-            self_idx = torch.arange(N, device=device)                   # (N,)
-            self_idx = self_idx.view(1, 1, N).expand(B, self.H, N)      # (B,H,N)
-        else:
-            self_idx = None  # cross-attn: no self-edge
-
-        neighbors, valid = merge_neighbors(
-            win_idx, glob_idx, lsh_idx,
-            self_idx = self_idx,
-            total_k  = self.K,
-            N=N, B=B, H=self.H, device=device,
-        )
-
-        out = sparse_gather_attention(
-            q, k, v, neighbors,
-            scale    = self.scale,
-            valid    = valid,
-            dropout  = self.dp,
-            training = self.training,
-            fp32_attn_weights = self.config.fp32_attn_weights,
-        )
+        neighbors, valid = self.build_graph(q, k, N, M, B, device, causal, is_cross)
+        out = self.apply_graph(q, k, v, neighbors, valid)
 
         out_proj = self.Wo(self._merge(out))
 
@@ -1360,6 +1404,248 @@ class SparseTransformer(nn.Module):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Cross-layer graph reuse (LSA-style Cross-Layer Indexing)
+#
+# Inspired by LongCat Sparse Attention's "Cross-Layer Indexing" (CLI):
+# https://longcat.chat/blog/longcat-2.0 -- LSA observed that attention
+# saliency is empirically stable across adjacent layers in a model trained
+# end-to-end with that property as a training-time distillation target,
+# and amortizes the indexer cost by reusing one indexing pass across
+# several consecutive layers at inference.
+#
+# IMPORTANT DISANALOGY -- read before using this in production:
+# LSA's indexer is LEARNED and trained jointly with the rest of the model
+# (continued pretraining + cross-layer distillation), specifically so the
+# model is pushed toward producing the cross-layer-stable saliency that
+# makes reuse safe. LSHGraphBuilder here is UNLEARNED and structural --
+# each layer's `rand_proj` buffer is an independently-initialized random
+# hyperplane set with no training signal pushing layer N's hash buckets to
+# resemble layer N+1's. There is no a priori reason to expect
+# cross-layer-stable neighbor selection here the way there is for a
+# content-based learned indexer.
+#
+# This class implements the mechanism (graph reuse across `reuse_every`
+# layers, sharing one LSHGraphBuilder instance across the group so the
+# hash projections are at least consistent within a reuse window) AND a
+# measurement utility (`measure_cross_layer_overlap`) to check whether the
+# stability assumption actually holds for a given model/config BEFORE
+# trusting cached output. Do not skip that measurement step --
+# see class docstring below for how to use it.
+# ────────────────────────────────────────────────────────────────────────────
+
+def neighbor_overlap(neighbors_a: torch.Tensor, neighbors_b: torch.Tensor,
+                      valid_a: torch.Tensor, valid_b: torch.Tensor) -> torch.Tensor:
+    """
+    Per-(batch, head, query) Jaccard similarity between two neighbor index
+    sets of shape (B, H, N, K). Used to measure how much overlap exists
+    between two layers' independently-built graphs for the same query
+    positions, BEFORE deciding cross-layer caching is safe to use.
+
+    Returns (B, H, N) float tensor in [0, 1]; 1.0 means identical neighbor
+    sets (ignoring order and invalid/padding slots), 0.0 means disjoint.
+
+    This is a CPU-friendly reference implementation (loops over the K
+    dimension with broadcasting, not a custom kernel) -- fine for an
+    offline diagnostic run on a handful of batches, not intended to run
+    inside the hot training/inference loop.
+    """
+    B, H, N, K = neighbors_a.shape
+    # Mask invalid slots to a sentinel value that can never collide with a
+    # real index (real indices are >= 0), so invalid slots never falsely
+    # count as a match between A and B.
+    sentinel = -1
+    a = torch.where(valid_a, neighbors_a, torch.full_like(neighbors_a, sentinel))
+    b = torch.where(valid_b, neighbors_b, torch.full_like(neighbors_b, sentinel))
+
+    # (B,H,N,K,1) vs (B,H,N,1,K) -> (B,H,N,K,K) match matrix
+    match = (a.unsqueeze(-1) == b.unsqueeze(-2))
+    # An index in A matches B if it equals ANY valid entry in B
+    a_in_b = match.any(dim=-1) & valid_a               # (B,H,N,K)
+    intersection = a_in_b.sum(dim=-1).float()          # (B,H,N)
+
+    union = (valid_a.sum(dim=-1) + valid_b.sum(dim=-1)).float() - intersection
+    union = union.clamp_min(1.0)  # avoid div-by-zero when both sets are empty
+    return intersection / union   # (B,H,N)
+
+
+def measure_cross_layer_overlap(
+    model: "SparseTransformer",
+    x: torch.Tensor,
+) -> dict:
+    """
+    Diagnostic: for a trained (or untrained) SparseTransformer, runs a
+    forward pass and measures neighbor-graph Jaccard overlap between every
+    pair of adjacent layers. This is the experiment that should be run
+    BEFORE adopting CachedGraphSparseTransformer for a real model --
+    see the module-level note above.
+
+    Usage:
+        model = SparseTransformer(cfg, num_layers=8)
+        x = torch.randn(4, 512, cfg.d_model)
+        report = measure_cross_layer_overlap(model, x)
+        print(report["mean_overlap_per_adjacent_pair"])
+        # e.g. [0.41, 0.38, 0.52, ...] -- one value per (layer_i, layer_i+1)
+        # pair. Values near 0 mean cross-layer caching would silently
+        # discard most of what the next layer would have actually attended
+        # to. There's no universal "safe" threshold here -- it depends on
+        # how much quality loss is tolerable for the compute saved -- but
+        # values well below the overlap LSA reports for their TRAINED,
+        # distilled indexer should be treated as a sign this technique
+        # needs training-time support to work here, not just inference-time
+        # wiring.
+
+    Returns a dict with raw per-layer-pair overlap tensors plus a
+    summary scalar per pair, intended for the caller to inspect/plot, not
+    to feed an automatic threshold decision.
+    """
+    hidden = x
+    if model.embed is not None:
+        hidden = model.embed(x)
+
+    per_layer_graphs = []
+    h = hidden
+    for layer in model.layers:
+        normed = layer.norm1(h)
+        attn = layer.attn
+        B, N, _ = normed.shape
+        is_cross = False
+        M = N
+        device = normed.device
+        causal = attn.config.causal
+
+        q = attn._split_q(attn.Wq(normed))
+        k = attn._split_kv(attn.Wk(normed))
+        v = attn._split_kv(attn.Wv(normed))
+
+        neighbors, valid = attn.build_graph(q, k, N, M, B, device, causal, is_cross)
+        per_layer_graphs.append((neighbors.detach(), valid.detach()))
+
+        out = attn.apply_graph(q, k, v, neighbors, valid)
+        a = attn.Wo(attn._merge(out))
+        h = h + a + layer.ff(layer.norm2(h + a))
+
+    overlaps = []
+    for i in range(len(per_layer_graphs) - 1):
+        n_a, v_a = per_layer_graphs[i]
+        n_b, v_b = per_layer_graphs[i + 1]
+        ov = neighbor_overlap(n_a, n_b, v_a, v_b)   # (B,H,N)
+        overlaps.append(ov)
+
+    return {
+        "per_pair_overlap":               overlaps,                              # list of (B,H,N) tensors
+        "mean_overlap_per_adjacent_pair": [ov.mean().item() for ov in overlaps], # list of floats
+        "num_layers":                     len(model.layers),
+    }
+
+
+class CachedGraphSparseTransformer(nn.Module):
+    """
+    SparseTransformer variant implementing LSA-style Cross-Layer Indexing:
+    the sparse neighbor graph is built once every `reuse_every` layers and
+    reused (re-applied to that layer's own q/k/v) for the layers in
+    between, skipping their window/global/LSH graph construction entirely.
+
+    Read the module-level docstring above this class before using this in
+    a real model -- this is an unlearned-LSH analog of a technique that,
+    in its original form, relies on the model being trained to make
+    cross-layer reuse safe. Run `measure_cross_layer_overlap` on your
+    model/config first.
+
+    Implementation notes:
+      - All layers within a `reuse_every`-sized group SHARE one
+        LSHGraphBuilder instance (and one window/global builder), so the
+        hash projections are at least consistent across the group. Without
+        this, "reusing the graph" would mean applying layer N's
+        hash-derived neighbor indices to layer N+1's Q/K, which were never
+        hashed by the same projection -- meaningless regardless of
+        cross-layer saliency stability.
+      - Each layer still has its OWN Wq/Wk/Wv/Wo projections and its own
+        FFN -- only the neighbor GRAPH (which key positions each query
+        attends to) is shared, not the attention weights or values
+        themselves. The actual attention scores/output differ per layer
+        even when the candidate neighbor set doesn't.
+      - The first layer in each group always does a full graph build
+        (recompute=True); subsequent layers in the group reuse it.
+    """
+
+    def __init__(self, config: SSAConfig, num_layers: int,
+                 reuse_every: int = 4, ffn_mult: int = 4):
+        super().__init__()
+        assert reuse_every >= 1
+        self.reuse_every = reuse_every
+        self.config = config
+
+        # One shared graph-builder set per group of `reuse_every` layers.
+        num_groups = math.ceil(num_layers / reuse_every)
+        self.shared_attn_per_group = nn.ModuleList([
+            SparseAttention(config) for _ in range(num_groups)
+        ])
+        # group_of[i] tells layer i which shared SparseAttention instance
+        # to borrow build_graph() from (its OWN Wq/Wk/Wv/Wo live on the
+        # per-layer SparseAttention below; the group instance is ONLY used
+        # for its graph-builder submodules).
+        self.group_of = [i // reuse_every for i in range(num_layers)]
+
+        self.layers = nn.ModuleList([
+            SparseTransformerLayer(config, ffn_mult) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(config.d_model)
+
+    def forward(self, x, return_stats: bool = False):
+        h = x
+        stats_list = []
+        cached_neighbors = None
+        cached_valid = None
+        cached_group = None
+
+        for i, layer in enumerate(self.layers):
+            group = self.group_of[i]
+            recompute = (group != cached_group)
+
+            normed = layer.norm1(h)
+            attn = layer.attn
+            B, N, _ = normed.shape
+            device = normed.device
+            causal = attn.config.causal
+
+            q = attn._split_q(attn.Wq(normed))
+            k = attn._split_kv(attn.Wk(normed))
+            v = attn._split_kv(attn.Wv(normed))
+
+            if recompute:
+                # Graph built using THIS GROUP's shared builder submodules,
+                # but against the CURRENT layer's q/k (each layer still has
+                # its own Wq/Wk projections -- only window/global/LSH
+                # builder PARAMETERS are shared within the group, not q/k
+                # themselves).
+                builder_attn = self.shared_attn_per_group[group]
+                neighbors, valid = builder_attn.build_graph(
+                    q, k, N, N, B, device, causal, is_cross=False
+                )
+                cached_neighbors, cached_valid, cached_group = neighbors, valid, group
+            else:
+                neighbors, valid = cached_neighbors, cached_valid
+
+            out = attn.apply_graph(q, k, v, neighbors, valid)
+            a = attn.Wo(attn._merge(out))
+            h = h + a + layer.ff(layer.norm2(h + a))
+
+            if return_stats:
+                peak_sparse = B * attn.H * N * attn.K * attn.d_head
+                peak_full   = B * attn.H * N * N * attn.d_head
+                stats_list.append({
+                    "neighbors_shape":   tuple(neighbors.shape),
+                    "compression":       peak_full / peak_sparse,
+                    "padding_fraction":  (~valid).float().mean().item(),
+                    "graph_recomputed":  recompute,
+                })
+            else:
+                stats_list.append({})
+
+        return self.norm(h), stats_list
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Test suite
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1379,7 +1665,7 @@ if __name__ == "__main__":
     print("=== 1. Self-attention ===")
     model = SparseTransformer(cfg, num_layers=2)
     x     = torch.randn(2, 64, cfg.d_model)
-    out, stats = model(x)
+    out, stats = model(x, return_stats=True)
     s = stats[0]
     print(f"  Shape: {tuple(x.shape)} → {tuple(out.shape)}")
     print(f"  Neighbors: {s['neighbors_shape']}  compression: {s['compression']:.1f}×  ✓")
@@ -1389,7 +1675,7 @@ if __name__ == "__main__":
     attn = SparseAttention(cfg)
     qx   = torch.randn(1, 48, cfg.d_model)
     kv   = torch.randn(1, 96, cfg.d_model)
-    co, cs = attn(qx, key_value=kv)
+    co, cs = attn(qx, key_value=kv, return_stats=True)
     print(f"  Q: {tuple(qx.shape)}  KV: {tuple(kv.shape)}  Out: {tuple(co.shape)}  ✓")
     # All neighbor indices must be < M=96
     nb_max = cs['neighbors_shape']
