@@ -258,15 +258,37 @@ rather than presenting the current approach as the only one considered.
 ## Testing
 
 ```bash
-python sparse_attention.py
+pip install pytest
+pytest
 ```
 
-Runs nine checks covering: self-attention shape correctness, cross-attention
-with N≠M, vectorized deduplication (no real duplicate neighbor indices,
-self always present), causal correctness (no future-token leakage in either
-LSH or window candidates), the empty-LSH-bucket fallback, cross-attention
-edge cases (no spurious self-edge), gradient flow (no NaNs), memory scaling,
-and the recall@K benchmark described above.
+Tests live in `tests/`, organized by what they cover rather than mirroring
+file structure:
+
+| File | Covers |
+|------|--------|
+| `test_attention_shapes.py` | Self/cross-attention shape correctness, `return_stats` contract |
+| `test_neighbor_graph.py` | Deduplication, self-edge placement, empty-bucket fallback |
+| `test_causal.py` | No future-token leakage in LSH or window candidates |
+| `test_gradients.py` | Gradient flow through the sparse gather/scatter machinery |
+| `test_quality_and_scaling.py` | O(NK) vs O(N²) memory scaling, recall@K vs exact dense top-K |
+| `test_gqa_mqa.py` | Grouped/multi-query attention parameter counts and correctness |
+| `test_global_tokens_and_mask_guard.py` | Explicit `global_token_indices`, the `attention_mask` rejection guard |
+| `test_build_apply_graph_split.py` | `build_graph()`/`apply_graph()` produce bit-identical output to `forward()` |
+| `test_cached_graph_transformer.py` | `CachedGraphSparseTransformer`, the `neighbor_overlap` diagnostic |
+
+The `test_quality_and_scaling.py::test_recall_at_k_beats_random_selection`
+test is the single most important one in the suite: every other test
+proves the routing machinery is mechanically correct (no crashes, no NaN,
+no out-of-range or duplicate indices) but says nothing about whether the
+selected neighbors are any *good*. This is the test that closes that gap
+— see [Recall and quality](#recall-and-quality) above for what the numbers
+mean and don't mean.
+
+`test_cached_graph_transformer.py::test_measure_cross_layer_overlap_on_untrained_model_is_not_near_one`
+is a deliberate guard against the cross-layer caching feature silently
+becoming unsafe-by-default — see
+[Cross-layer graph caching](#cross-layer-graph-caching-experimental) above.
 
 ## License
 
