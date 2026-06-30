@@ -148,9 +148,8 @@ wasteful) when applied to a shorter one.
 
 ## Recall and quality
 
-The in-file test suite (`python sparse_attention.py`) includes a
-recall@K benchmark against exact dense top-K attention on random
-embeddings:
+`tests/test_quality_and_scaling.py` includes a recall@K benchmark against
+exact dense top-K attention on random embeddings:
 
 ```
 N=1024, K=64, true_k=32
@@ -179,6 +178,56 @@ Memory scaling, same test suite, exact O(N²) vs O(NK) elements:
 
 Compression scales with N as expected for a fixed K — the longer the
 sequence, the larger the win.
+
+## Benchmarks
+
+`benchmarks/bench_dense_vs_sparse.py` compares `SparseAttention` against
+`F.scaled_dot_product_attention` directly — wall-clock and the same
+tensor-size scaling shown above, side by side.
+
+```bash
+python benchmarks/bench_dense_vs_sparse.py
+```
+
+**Headline result, measured on CPU (single core, no CUDA), not assumed:**
+
+```
+     N |   Dense (ms) |  Sparse (ms) |  Speedup | Dense tensor (MB) | Sparse tensor (MB) | Mem ratio
+   256 |         3.94 |        62.39 |    0.06x |              1.05 |               0.52 |       2.0x
+   512 |         7.08 |       126.09 |    0.06x |              4.19 |               1.05 |       4.0x
+  1024 |        17.44 |       259.18 |    0.07x |             16.78 |               2.10 |       8.0x
+  2048 |        56.02 |       544.34 |    0.10x |             67.11 |               4.19 |      16.0x
+  4096 |       202.81 |      1131.41 |    0.18x |            268.44 |               8.39 |      32.0x
+  8192 |       782.37 |      2467.90 |    0.32x |           1073.74 |              16.78 |      64.0x
+```
+
+**Dense is currently faster on this hardware at every N tested**, though
+the gap narrows sharply as N grows (15x slower at N=256 → ~3x slower at
+N=8192 — extrapolate the trend). This is the opposite of the usual sparse-
+attention pitch, and it's reported here rather than worked around, because
+it's true and explains something real.
+
+The `run_profile_breakdown` function in the same script shows why: roughly
+**55% of `SparseAttention`'s CPU time goes to `aten::index_select`** — the
+gather operations that pull selected neighbor candidates out of K/V.
+Gather has poor cache locality and doesn't vectorize the way a dense
+matmul does; `F.scaled_dot_product_attention` on CPU is backed by a fused,
+heavily optimized kernel that dense attention gets essentially for free by
+being one big matmul. `SparseAttention` pays a real per-element indexing
+tax that dense attention doesn't, because this repo uses plain `torch`
+indexing rather than a custom gather/scatter kernel.
+
+This is a property of *this implementation* (portable, dependency-free,
+pure PyTorch) on *this hardware* (CPU), not evidence that sparse attention
+as an idea is slower than dense. The actual payoff — avoiding O(N²) memory
+and compute — only becomes a net wall-clock win once N is large enough
+that dense attention's quadratic cost outweighs the gather tax, and/or on
+hardware with a fast gather/scatter path (GPU + a custom Triton/CUDA
+kernel, which is what production systems like FlashAttention-derived
+sparse variants and DeepSeek's DSA actually ship). If you need a wall-clock
+win at moderate N on CPU, this implementation as written won't give you
+one — that's the honest result of actually running it, not a claim made
+in either direction without measurement.
 
 ## Architecture / integration
 
