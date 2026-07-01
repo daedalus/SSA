@@ -224,6 +224,33 @@ class SSAConfig:
                                        # (reduces false-negative bucket misses:
                                        #  empirically ~9% at 1 round → ~0% at 4,
                                        #  see test_multi_round_lsh.py)
+    lsh_num_probes:    int   = 0     # multi-probe LSH: additional buckets checked
+                                       # per round, per query, beyond the query's own
+                                       # bucket. Each probe flips the single lowest-
+                                       # confidence hash bit (smallest |hyperplane
+                                       # projection|) not yet flipped, i.e. probe 1
+                                       # checks the bucket one bit-flip away from the
+                                       # query's own bucket on the boundary it's
+                                       # closest to, probe 2 the next-closest
+                                       # boundary, etc. (standard step-wise multi-
+                                       # probe LSH; see LSHGraphBuilder._probe_ids).
+                                       # This targets false negatives from queries
+                                       # that land near a hyperplane boundary --
+                                       # exactly the failure mode num_hash_rounds
+                                       # already reduces via independent rehashing,
+                                       # but multi-probe targets it directly within
+                                       # a single round instead of relying on a
+                                       # different round's random projection to
+                                       # happen to separate the pair correctly.
+                                       # Cost: each probe adds another C-sized
+                                       # candidate gather per round, i.e. total
+                                       # rescore cost scales with
+                                       # R * (1 + lsh_num_probes), same as
+                                       # increasing num_hash_rounds by that
+                                       # factor -- see benchmarks/bench_multiprobe.py
+                                       # for the actual recall/speed tradeoff,
+                                       # measured, not assumed. Default 0 preserves
+                                       # exact prior behavior.
     window_size:       int   = 16    # local window half-width
     num_global_tokens: int   = 2     # key tokens seen by all queries.
                                        # Governs the DEFAULT behaviour (first G
@@ -439,7 +466,8 @@ class LSHGraphBuilder(nn.Module):
     """
 
     def __init__(self, d_head: int, lsh_candidates: int,
-                 num_rounds: int = 1, max_num_hashes: int = 12):
+                 num_rounds: int = 1, max_num_hashes: int = 12,
+                 num_probes: int = 0):
         super().__init__()
         # max_num_hashes is a CEILING on bucket count, not the bucket
         # count itself — see forward()'s P_eff computation. The same
@@ -462,6 +490,9 @@ class LSHGraphBuilder(nn.Module):
                                           # also the target bucket occupancy used
                                           # to derive P_eff in forward()
         self.R = num_rounds
+        assert num_probes >= 0, f"num_probes must be >= 0, got {num_probes}"
+        self.T = num_probes              # multi-probe: extra buckets checked per
+                                          # round beyond the query's own bucket
         # Independent random projection per round, registered at the
         # CEILING plane count. forward() slices the first P_eff rows per
         # call — slicing a view is free; this lets one buffer serve any
@@ -554,37 +585,80 @@ class LSHGraphBuilder(nn.Module):
         powers = 2 ** torch.arange(p_eff, device=x.device)
         return (bits * powers).sum(-1)
 
-    def _single_round(
+    def _hash_proj(self, x: torch.Tensor, round_idx: int, p_eff: int) -> torch.Tensor:
+        """Same projection `_hash` computes internally, exposed directly so
+        `_probe_ids` can rank bits by confidence (|proj|) without
+        recomputing the matmul. Always FP32 -- see `_hash` docstring."""
+        return x.float() @ self.rand_proj[round_idx, :p_eff].T   # (..., p_eff)
+
+    def _probe_ids(self, proj: torch.Tensor, p_eff: int, num_probes: int) -> list:
+        """
+        Step-wise multi-probe LSH (Lv et al.): given a query's hyperplane
+        projections for one round, return up to `num_probes` additional
+        bucket ids beyond the query's own bucket, each one bit-flip away.
+
+        Rationale: a query near a hyperplane boundary (small |proj| on
+        that bit) is the case single-bucket lookup gets wrong most often
+        -- the "true" neighbor landed on the other side of a coin-flip-
+        close decision. Rather than adding a whole extra independent
+        hash round to catch this (linear cost, no guarantee it targets
+        THIS boundary), multi-probe explicitly checks the buckets
+        adjacent to the boundary this specific query is closest to.
+
+        Probes are ranked by ascending |proj| (least confident bit
+        first) and applied one bit at a time, not combinatorially (i.e.
+        probe 2 flips the 2nd-least-confident bit relative to the
+        ORIGINAL id, not the already-flipped probe-1 id) -- this is the
+        standard single-flip step-wise variant, not full multi-probe
+        with combined multi-bit perturbations, which would need
+        2^num_probes buckets to enumerate the same coverage. Single-flip
+        gives the highest marginal recall per extra bucket checked, since
+        the lowest-margin bit is disproportionately likely to be a false
+        boundary crossing.
+
+        Returns a list of `min(num_probes, p_eff)` LongTensors, each
+        shaped like the leading dims of `proj` (i.e. (..., ) with the
+        trailing p_eff dim reduced away) -- one alternate bucket id per
+        probe. Empty list if num_probes <= 0 or p_eff == 0.
+        """
+        num_probes = min(num_probes, p_eff)
+        if num_probes <= 0:
+            return []
+        bits   = (proj > 0).long()                        # (..., p_eff)
+        powers = 2 ** torch.arange(p_eff, device=proj.device)
+        base_id = (bits * powers).sum(-1)                  # (...,)
+        margins = proj.abs()                                # (..., p_eff)
+        order = margins.argsort(dim=-1)                     # ascending: least confident first
+
+        probe_ids = []
+        for t in range(num_probes):
+            pos = order[..., t]                              # (...,) bit index to flip
+            bit_val = torch.gather(bits, -1, pos.unsqueeze(-1)).squeeze(-1)
+            pow_val = powers[pos]                            # fancy-indexes powers per element
+            # bit was 1 -> flipping to 0 subtracts pow_val; bit was 0 -> flipping to 1 adds it.
+            delta = pow_val * (1 - 2 * bit_val)
+            probe_ids.append(base_id + delta)
+        return probe_ids
+
+    def _gather_bucket(
         self,
-        q_flat: torch.Tensor,   # (BH, N, d)
-        k_flat: torch.Tensor,   # (BH, M, d)
-        round_idx: int,
-        top_k: int,
+        q_ids: torch.Tensor,      # (BH, N) bucket id per query, ANY id set (primary or probe)
+        bstart: torch.Tensor,     # (BH, num_buckets)
+        bsize: torch.Tensor,      # (BH, num_buckets)
+        perm: torch.Tensor,       # (BH, M) sort permutation from k_ids
+        N: int, M: int, C: int,
         causal: bool,
         glob_fallback: torch.Tensor,
-        p_eff: int,
-    ) -> torch.Tensor:
-        """One hash round, fully vectorised over BH. Returns (cand_key_idx, valid),
-        each (BH, N, top_k): candidate key indices and a boolean validity mask
-        (False = overflow padding from a bucket smaller than C, must be
-        masked to -inf before top-k so it can never be selected)."""
-        BH, N, d = q_flat.shape
-        M           = k_flat.shape[1]
-        device      = q_flat.device
-        C           = self.C
-        num_buckets = 2 ** p_eff
-
-        q_ids = self._hash(q_flat, round_idx, p_eff)   # (BH, N)
-        k_ids = self._hash(k_flat, round_idx, p_eff)   # (BH, M)
-
-        sorted_k_ids, perm = torch.sort(k_ids, dim=-1)
-
-        bstart = torch.full((BH, num_buckets), M, dtype=torch.long, device=device)
-        positions = torch.arange(M, device=device).unsqueeze(0).expand(BH, M)
-        bstart.scatter_reduce_(1, sorted_k_ids, positions, reduce='amin', include_self=True)
-
-        bsize = torch.zeros((BH, num_buckets), dtype=torch.long, device=device)
-        bsize.scatter_add_(1, sorted_k_ids, torch.ones_like(sorted_k_ids))
+        device,
+    ):
+        """Given a bucket id per query (whichever id set -- the query's own
+        bucket, or a multi-probe alternate bucket), gather that bucket's
+        (up to C) members. Factored out of `_single_round` so probe buckets
+        go through byte-identical logic to the primary bucket -- same
+        overflow-padding, causal future-masking, and empty-bucket fallback,
+        just keyed by a different `q_ids` tensor. Returns (cand_key_idx,
+        valid), each (BH, N, C)."""
+        BH = q_ids.shape[0]
 
         q_start = torch.gather(bstart, 1, q_ids)
         q_size  = torch.gather(bsize,  1, q_ids)
@@ -593,14 +667,17 @@ class LSHGraphBuilder(nn.Module):
         cand_pos   = q_start.unsqueeze(-1) + off                      # (BH,N,C)
         bucket_end = (q_start + q_size - 1).clamp(max=M - 1)          # (BH,N)
 
-        # BUG FIX (duplicate candidates in small buckets): clamping overflow
-        # offsets to bucket_end made every slot past the real bucket size
-        # repeat the SAME last member (e.g. bucket_size=3, C=8 produced
+        # BUG FIX (duplicate candidates in small buckets), preserved from
+        # the pre-multi-probe implementation: clamping overflow offsets to
+        # bucket_end made every slot past the real bucket size repeat the
+        # SAME last member (e.g. bucket_size=3, C=8 produced
         # [m0,m1,m2,m2,m2,m2,m2,m2]). topk then returned that repeated
         # index multiple times since identical scores all "win". Fix: mark
         # overflow slots invalid (position M, one-past-end) instead of
         # clamping, and carry a validity mask through to scoring so
         # invalid slots are masked to -inf and can never be selected twice.
+        # Applies identically to probe buckets: a probe bucket smaller
+        # than C overflows exactly the same way the primary bucket does.
         valid = cand_pos <= bucket_end.unsqueeze(-1)                  # (BH,N,C)
         cand_pos = torch.where(valid, cand_pos, torch.full_like(cand_pos, M))
         cand_pos = cand_pos.clamp(max=M)  # M itself is the sentinel row, handled below
@@ -615,23 +692,12 @@ class LSHGraphBuilder(nn.Module):
 
         if causal:
             # Future candidates (key_pos > query_pos) are replaced with the
-            # self position rather than a global-fallback or sentinel.
-            # This was flagged as creating extra self-duplicates that
-            # reduce candidate diversity before merge. In practice this is
-            # harmless, not just "fine after merge": `merge_neighbors`
-            # already excludes self from the dedup pool entirely (see its
-            # docstring's self-edge-double-count fix) and collapses
-            # repeated raw values to their true unique count, so a token
-            # with many future-masked LSH slots simply ends up with fewer
-            # real LSH-sourced neighbors and relies more on window/global —
-            # never on inflated self-weight. Verified directly: an early
-            # causal token (mostly future-masked) ends with self appearing
-            # exactly once and an honestly small set of real neighbors,
-            # not a self-dominated attention pattern. Global-token
-            # substitution here would add diversity for tokens with very
-            # little causal history, which IS a legitimate enhancement —
-            # just not a correctness fix, since the current behavior never
-            # produces duplicate or biased attention weight.
+            # self position rather than a global-fallback or sentinel. See
+            # `_single_round`'s pre-refactor docstring for the full
+            # rationale (merge_neighbors dedups self, so this never
+            # inflates self-weight). Applies to probe buckets too: a probe
+            # bucket can contain future positions exactly like the primary
+            # bucket can.
             query_pos = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
             future    = cand_key_idx > query_pos
             self_safe = torch.arange(N, device=device).view(1, N, 1).expand(BH, N, C)
@@ -639,40 +705,21 @@ class LSHGraphBuilder(nn.Module):
 
         empty_rows = (q_size == 0)   # (BH, N)
         if empty_rows.any():
+            # Global-token fallback for empty buckets -- see the original
+            # `_single_round` docstring (pre-refactor) for the full
+            # quantified-risk analysis (0% all-rounds-empty in the
+            # recommended occupancy regime; only a real risk under
+            # deliberate lsh_candidates misconfiguration). Probe buckets
+            # are MORE likely to be empty than primary buckets by
+            # construction -- they're chosen specifically because they're
+            # adjacent to a near-boundary query, which correlates with
+            # small/sparse buckets near the tails of the bucket occupancy
+            # distribution -- so this fallback path is exercised more
+            # often under multi-probe than without it. That's expected
+            # and harmless: an empty probe bucket falling back to global
+            # tokens just means that probe contributed nothing beyond
+            # what global already provides, not a correctness issue.
             G  = glob_fallback.shape[0]
-            # Repeating global_fallback to fill C candidate slots (e.g.
-            # G=2 tiled across C=32 slots as [0,1,0,1,...]) was flagged as
-            # wasting candidate-slot budget on redundant copies of the same
-            # small global set, rather than e.g. cyclic/random diversity.
-            # This no longer matters in practice: `merge_neighbors`
-            # deduplicates the final neighbor list before it reaches
-            # attention, so G repeated values collapse to G real entries
-            # regardless of how many times each was repeated here — the
-            # repetition was always going to be discarded downstream, not
-            # silently double-counted. Left as a flat tile (not cyclic)
-            # since cyclic ordering provides no benefit once a single
-            # post-dedup pass removes all but the first occurrence anyway.
-            #
-            # QUANTIFIED QUALITY RISK (when this fallback path matters):
-            # measured directly — at the adaptive bucket sizing this module
-            # uses by default (occupancy ≈ C via compute_effective_p), the
-            # fraction of queries hitting empty_rows in ALL R rounds
-            # simultaneously was 0% across N=256/1024/4096 in testing
-            # (multi-round independence makes "empty in every round"
-            # vanishingly rare once occupancy is in the recommended range
-            # — P(empty in all R) ≈ P(empty in one round)^R). HOWEVER, in
-            # a deliberately misconfigured regime (e.g. lsh_candidates set
-            # far smaller than what compute_effective_p would imply,
-            # forcing occupancy << 1), this stops being rare: measured 234
-            # of 256 queries (91%) with a genuinely empty bucket at
-            # occupancy=0.06, all collapsing to the SAME 2 global-token
-            # candidates regardless of query content — i.e. near-total
-            # loss of query-specific routing for the majority of tokens.
-            # This is a real risk, but specifically a misconfiguration
-            # risk (occupancy far below C), not a property of the default
-            # adaptive sizing path. If overriding lsh_candidates manually,
-            # keep it large enough that compute_effective_p's target
-            # occupancy assumption (≈C) stays roughly true for your N.
             fb = glob_fallback.view(1, 1, G).expand(BH, N, G)
             if G >= C:
                 fb = fb[..., :C]
@@ -685,6 +732,66 @@ class LSHGraphBuilder(nn.Module):
             valid = valid | empty_rows.unsqueeze(-1).expand_as(valid)
 
         return cand_key_idx, valid   # (BH, N, C) each
+
+    def _single_round(
+        self,
+        q_flat: torch.Tensor,   # (BH, N, d)
+        k_flat: torch.Tensor,   # (BH, M, d)
+        round_idx: int,
+        top_k: int,
+        causal: bool,
+        glob_fallback: torch.Tensor,
+        p_eff: int,
+        num_probes: int = 0,
+    ) -> torch.Tensor:
+        """One hash round, fully vectorised over BH. Returns (cand_key_idx, valid),
+        each (BH, N, C*(1+num_probes_used)): candidate key indices and a boolean
+        validity mask (False = overflow padding from a bucket smaller than C,
+        must be masked to -inf before top-k so it can never be selected).
+
+        With num_probes > 0 (multi-probe LSH), the query's own bucket AND
+        `num_probes` additional near-boundary buckets (see `_probe_ids`)
+        are each gathered via `_gather_bucket` and concatenated along the
+        candidate axis before returning -- from the caller's (`forward`'s)
+        point of view this is indistinguishable from having C been larger,
+        it's just sourced from multiple buckets instead of one. The
+        cross-round union/dedup in `forward` handles any overlap between a
+        probe bucket and another round's primary bucket for free."""
+        BH, N, d = q_flat.shape
+        M           = k_flat.shape[1]
+        device      = q_flat.device
+        C           = self.C
+        num_buckets = 2 ** p_eff
+
+        q_proj = self._hash_proj(q_flat, round_idx, p_eff)   # (BH, N, p_eff)
+        k_ids  = self._hash(k_flat, round_idx, p_eff)         # (BH, M)
+        bits   = (q_proj > 0).long()
+        powers = 2 ** torch.arange(p_eff, device=device)
+        q_ids  = (bits * powers).sum(-1)                       # (BH, N) -- primary bucket
+
+        sorted_k_ids, perm = torch.sort(k_ids, dim=-1)
+
+        bstart = torch.full((BH, num_buckets), M, dtype=torch.long, device=device)
+        positions = torch.arange(M, device=device).unsqueeze(0).expand(BH, M)
+        bstart.scatter_reduce_(1, sorted_k_ids, positions, reduce='amin', include_self=True)
+
+        bsize = torch.zeros((BH, num_buckets), dtype=torch.long, device=device)
+        bsize.scatter_add_(1, sorted_k_ids, torch.ones_like(sorted_k_ids))
+
+        id_sets = [q_ids] + self._probe_ids(q_proj, p_eff, num_probes)
+
+        cand_list, valid_list = [], []
+        for ids in id_sets:
+            cand, valid = self._gather_bucket(
+                ids, bstart, bsize, perm, N, M, C, causal, glob_fallback, device,
+            )
+            cand_list.append(cand)
+            valid_list.append(valid)
+
+        cand_key_idx = torch.cat(cand_list, dim=-1)   # (BH, N, C*len(id_sets))
+        valid        = torch.cat(valid_list, dim=-1)
+
+        return cand_key_idx, valid
 
     def forward(
         self,
@@ -732,9 +839,9 @@ class LSHGraphBuilder(nn.Module):
         round_cands, round_valids = [], []
         for r in range(self.R):
             cand, valid = self._single_round(q_flat, k_flat, r, top_k, causal,
-                                             glob_fallback, p_eff)
-            round_cands.append(cand)    # (BH, N, C)
-            round_valids.append(valid)  # (BH, N, C)
+                                             glob_fallback, p_eff, self.T)
+            round_cands.append(cand)    # (BH, N, C*(1+T_used))
+            round_valids.append(valid)  # (BH, N, C*(1+T_used))
 
         all_cand  = torch.cat(round_cands, dim=-1)    # (BH, N, R*C)
         all_valid = torch.cat(round_valids, dim=-1)   # (BH, N, R*C)
@@ -1147,6 +1254,7 @@ class SparseAttention(nn.Module):
             max_num_hashes  = config.max_num_hashes,
             lsh_candidates  = self.lsh_k * 4,
             num_rounds      = config.num_hash_rounds,
+            num_probes      = config.lsh_num_probes,
         )
         self.dp = config.dropout
 

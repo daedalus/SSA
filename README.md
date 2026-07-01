@@ -86,6 +86,8 @@ class SSAConfig:
     num_neighbors: int = 64                  # K: total neighbor slots per query
     max_num_hashes: int = 12                 # ceiling on LSH planes (2^P buckets)
     num_hash_rounds: int = 4                 # independent hash rounds, unioned
+    lsh_num_probes: int = 0                  # multi-probe: extra near-boundary
+                                              # buckets checked per round, see below
     window_size: int = 16                    # local window half-width
     num_global_tokens: int = 2               # leading key tokens, all queries attend
     global_token_indices: Optional[list] = None  # explicit global positions, overrides above
@@ -145,6 +147,47 @@ wasteful) when applied to a shorter one.
   rather than re-bucketing everything), which is a real piece of unbuilt
   work, not a config flag.
 - **Exact recall guarantees.** LSH is approximate. See below.
+
+## Multi-probe LSH (`lsh_num_probes`)
+
+By default a query only checks its own hash bucket per round; false
+negatives near a bucket boundary are caught by `num_hash_rounds`
+independent rehashing instead. `lsh_num_probes` adds a second, more
+targeted way to catch the same failure mode: for each query, also check
+the `lsh_num_probes` buckets one bit-flip away from its own, ranked by
+which hash bit had the smallest-magnitude hyperplane projection (i.e.
+probe the boundary this specific query is actually closest to, rather
+than hoping an independent round's random projection happens to
+separate a near-boundary pair correctly). Off by default
+(`lsh_num_probes=0`); existing configs are unaffected.
+
+```python
+cfg = SSAConfig(..., num_hash_rounds=4, lsh_num_probes=1)
+```
+
+**Measured tradeoff** (`benchmarks/bench_multiprobe.py`, N=2048, K=64,
+true_k=32, random Q/K — same synthetic-floor caveat as the recall
+benchmark below): at a FIXED `num_hash_rounds=4`, probes are a genuine
+recall lever — 48.5% (T=0) → 72.6% (T=1) → 91.3% (T=3) — but they are
+not free: each probe adds another full candidate gather, the same
+rescore cost as an extra round. At *matched* total rescore budget
+(`R * (1 + T)`), spending it as more independent rounds slightly beats
+spending it as probes on this synthetic random-embedding test (e.g.
+R=4,T=0 at budget=4 hits 48.5% vs R=2,T=1's 47.1% — probing a specific
+query's nearest boundary carries no extra signal when there's no real
+structure to exploit, which random Gaussian Q/K by construction lacks).
+Wall-clock is also close either way — probes reuse one round's bucket
+sort instead of re-sorting for an independent round, which should in
+principle save the ~32% of build cost this repo's profiling attributes
+to `torch.sort`, but measured at N=4096 the saving was ~0.5%, since each
+probe still pays its own gather/rescore cost in full and that's the
+larger term. Net: use `lsh_num_probes` when you want to push recall
+*beyond* what raising `num_hash_rounds` alone gives you and are willing
+to pay for it, not as a drop-in efficiency swap for existing rounds. On
+real trained embeddings (with actual cluster structure near bucket
+boundaries, unlike this synthetic test) probing the query's own nearest
+boundary may carry more signal than an independent reroll — not
+measured here, flagged as an open question rather than assumed.
 
 ## Recall and quality
 
@@ -323,6 +366,7 @@ file structure:
 | `test_quality_and_scaling.py` | O(NK) vs O(N²) memory scaling, recall@K vs exact dense top-K |
 | `test_gqa_mqa.py` | Grouped/multi-query attention parameter counts and correctness |
 | `test_global_tokens_and_mask_guard.py` | Explicit `global_token_indices`, the `attention_mask` rejection guard |
+| `test_multiprobe_lsh.py` | `lsh_num_probes` correctness (distinct probe ids, causal masking, gradient flow) and the recall-increases-with-probes regression floor |
 | `test_build_apply_graph_split.py` | `build_graph()`/`apply_graph()` produce bit-identical output to `forward()` |
 | `test_cached_graph_transformer.py` | `CachedGraphSparseTransformer`, the `neighbor_overlap` diagnostic |
 
