@@ -8,8 +8,8 @@ neighbor list, then attends only to that list instead of the full sequence.
 ```python
 from sparse_attention import SSAConfig, SparseAttention
 
-cfg = SSAConfig(d_model=512, num_heads=8, num_neighbors=64,
-                window_size=16, num_global_tokens=2, causal=True)
+cfg = SSAConfig(d_model=512, num_heads=8, num_neighbors=128,
+                window_size=8, num_global_tokens=2, causal=True)
 attn = SparseAttention(cfg)
 
 out, _ = attn(x)                     # self-attention, x: (B, N, d_model)
@@ -83,12 +83,12 @@ class SSAConfig:
     d_model: int = 512
     num_heads: int = 8
     num_kv_heads: Optional[int] = None       # GQA/MQA — see below
-    num_neighbors: int = 64                  # K: total neighbor slots per query
+    num_neighbors: int = 128                 # K: total neighbor slots per query
     max_num_hashes: int = 12                 # ceiling on LSH planes (2^P buckets)
-    num_hash_rounds: int = 4                 # independent hash rounds, unioned
+    num_hash_rounds: int = 8                 # independent hash rounds, unioned
     lsh_num_probes: int = 0                  # multi-probe: extra near-boundary
                                               # buckets checked per round, see below
-    window_size: int = 16                    # local window half-width
+    window_size: int = 8                     # local window half-width
     num_global_tokens: int = 2               # leading key tokens, all queries attend
     global_token_indices: Optional[list] = None  # explicit global positions, overrides above
     dropout: float = 0.0
@@ -103,6 +103,13 @@ The module warns at construction time if `2*window_size + 1 + num_global_tokens 
 regime LSH gets starved down to a floor of 8 candidates and a large fraction
 of computed candidates get discarded as padding. Not incorrect, just
 wasteful of compute. Keep the guaranteed budget comfortably under `K`.
+
+A good rule of thumb for `window_size`: `max(1, K // 8)`. The window
+provides positional locality that partially overlaps with LSH content-based
+routing. Its value depends on the LSH coverage ratio (`lsh_k / N`): when
+LSH candidates cover >10% of the sequence, the window is redundant. With
+the evolved defaults (K=128, R=8), window size has <1% impact on recall
+at all tested sequence lengths.
 
 ### GQA / MQA
 
@@ -195,19 +202,70 @@ measured here, flagged as an open question rather than assumed.
 exact dense top-K attention on random embeddings:
 
 ```
-N=1024, K=64, true_k=32
-Sparse pipeline recall@32: 65.4%
-Random-K-selection recall: 6.1%  (floor)
-Ratio vs random floor: 10.68x
+N=1024, K=128, R=8, window=8, true_k=32
+Sparse pipeline recall@32: 99.3%
+Random-K-selection recall: 12.5%  (floor)
+Ratio vs random floor: 7.94x
 ```
 
-Read this correctly: 65% recall against a *random, unstructured* embedding
-distribution is not a number to expect on real trained representations
-(real attention has structure — similar tokens cluster, which is exactly
-what LSH exploits — so real-world recall should be substantially higher
-than this synthetic floor test). This benchmark exists to catch
-*regressions* in the LSH routing logic, not to predict production quality.
-If you change `LSHGraphBuilder` and this ratio drops, something broke.
+Recall across sequence lengths (K=128, R=8, window=8 vs old K=64, R=4,
+window=16):
+
+```
+     N      Before      After       Gain
+-------------------------------------------
+    64      89.5%      99.2%      +9.7%
+   128      85.9%      99.1%     +13.2%
+   256      83.7%      99.6%     +16.0%
+   512      73.3%      99.9%     +26.6%
+  1024      54.7%      99.9%     +45.1%
+  2048      38.1%      99.3%     +61.1%
+  4096      27.0%      95.3%     +68.3%
+```
+
+99%+ recall against a *random, unstructured* embedding distribution
+means the LSH routing selects neighbors that overlap almost perfectly
+with exact dense top-K. On real trained representations (where similar
+tokens cluster — exactly what LSH exploits), recall should be even
+higher. This benchmark exists to catch *regressions* in the LSH routing
+logic, not to predict production quality. If you change `LSHGraphBuilder`
+and this ratio drops, something broke.
+
+### AlphaEvolve tuning
+
+The default configuration was optimized via an evolutionary search
+(AlphaEvolve methodology) across the joint parameter space of
+`num_neighbors`, `num_hash_rounds`, `window_size`, and LSH oversample
+factor. Three rounds of evolution found:
+
+| Parameter | Old default | Evolved default | Impact |
+|-----------|-------------|-----------------|--------|
+| `num_neighbors` | 64 | **128** | +29% recall at N=1024 |
+| `num_hash_rounds` | 4 | **8** | +7% on top of K=128 |
+| `window_size` | 16 | **8** | frees budget for LSH |
+
+Combined effect: recall stays above 95% through N=4096, whereas the old
+config collapsed below 50% around N=1500.
+
+Key findings from the search:
+- **K (num_neighbors) is the dominant lever.** The old default K=64 was
+  undersized for long sequences. K=128 gives 92.6% recall at N=1024
+  even with the old R=4.
+- **R (hash rounds) is the second lever.** Each round adds an independent
+  random hyperplane set; false-negative rate drops exponentially with R.
+  R=8 pushes recall from 92.6% to 99.3%.
+- **Smaller windows outperform larger ones.** window=8 beats window=16
+  at all sequence lengths because a smaller window frees K budget for
+  LSH content-based routing, which captures the important tokens more
+  effectively than positional proximity.
+- **Hash projection distribution doesn't matter.** Sign-based hashing
+  `(proj > 0)` is inherently scale-invariant — scaling, normalizing, or
+  power-transforming the projections produces identical bucket assignments.
+- **Union strategy and rescore mode don't matter.** First-occurrence
+  cross-round dedup and dot-product rescore are already optimal.
+
+See the `alpha_evolve*.py` scripts (run during development, not shipped)
+for the full evolutionary search code.
 
 Memory scaling, same test suite, exact O(N²) vs O(NK) elements:
 

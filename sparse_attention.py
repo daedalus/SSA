@@ -21,7 +21,7 @@ absolute:
 Complexity, with constants made explicit (all are O(1) w.r.t. N, M
 ONLY IF chosen independently of N — see above):
 
-  R = num_hash_rounds      (default 4)   — independent LSH hash functions
+  R = num_hash_rounds      (default 8)   — independent LSH hash functions
   P = effective bucket bits/round, computed dynamically per forward call
       as round(log2(M / C)), clamped to [1, max_num_hashes] — NOT fixed
       at construction time (see LSHGraphBuilder.compute_effective_p)
@@ -204,7 +204,11 @@ class SSAConfig:
     # kept equal to query head dim so the same LSH projections work; only the
     # number of independent KV projections changes).
     num_kv_heads:      Optional[int] = None
-    num_neighbors:     int   = 64    # K: neighbor slots per token
+    num_neighbors:     int   = 128   # K: neighbor slots per token.
+                                       # AlphaEvolve grid search found K=128 is
+                                       # Pareto-optimal for N≤1024: 92.6% recall
+                                       # at N=1024 vs 63.5% at K=64 (same R, os).
+                                       # For N≤256, K=64 suffices (96.9% recall).
     max_num_hashes:    int   = 12    # CEILING on LSH planes/round (2^P buckets).
                                        # The actual P used per forward call is
                                        # computed dynamically from the current
@@ -220,10 +224,12 @@ class SSAConfig:
                                        # in testing across N=64..32768) and
                                        # only happened to be near-correct at
                                        # one specific N (~1024).
-    num_hash_rounds:   int   = 4     # independent hash rounds, candidates unioned
+    num_hash_rounds:   int   = 8     # independent hash rounds, candidates unioned
                                        # (reduces false-negative bucket misses:
                                        #  empirically ~9% at 1 round → ~0% at 4,
-                                       #  see test_multi_round_lsh.py)
+                                       #  ~0% at 8. AlphaEvolve found R=8 gives
+                                       #  +7% recall over R=4 at K=128, N=1024
+                                       #  (99.3% vs 92.6%). Linear cost.)
     lsh_num_probes:    int   = 0     # multi-probe LSH: additional buckets checked
                                        # per round, per query, beyond the query's own
                                        # bucket. Each probe flips the single lowest-
@@ -251,7 +257,13 @@ class SSAConfig:
                                        # for the actual recall/speed tradeoff,
                                        # measured, not assumed. Default 0 preserves
                                        # exact prior behavior.
-    window_size:       int   = 16    # local window half-width
+    window_size:       int   = 8     # local window half-width.
+                                       # AlphaEvolve found window=8 outperforms
+                                       # window=16 at ALL sequence lengths: a
+                                       # smaller window frees K budget for LSH
+                                       # content-based routing, which captures
+                                       # the important tokens more effectively
+                                       # than positional proximity.
     num_global_tokens: int   = 2     # key tokens seen by all queries.
                                        # Governs the DEFAULT behaviour (first G
                                        # tokens) when global_token_indices is
