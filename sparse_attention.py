@@ -848,15 +848,18 @@ class LSHGraphBuilder(nn.Module):
         k_flat = k.reshape(BH, M, d)
 
         # ── Collect candidates from every round, union them ─────────────
+        # All index tensors use int32 (sequence lengths fit) to halve
+        # memory vs int64 — significant at large N where index tensors
+        # dominate peak allocation.
         round_cands, round_valids = [], []
         for r in range(self.R):
             cand, valid = self._single_round(q_flat, k_flat, r, top_k, causal,
                                              glob_fallback, p_eff, self.T)
-            round_cands.append(cand)    # (BH, N, C*(1+T_used))
-            round_valids.append(valid)  # (BH, N, C*(1+T_used))
+            round_cands.append(cand.to(torch.int32))
+            round_valids.append(valid)
 
-        all_cand  = torch.cat(round_cands, dim=-1)    # (BH, N, R*C)
-        all_valid = torch.cat(round_valids, dim=-1)   # (BH, N, R*C)
+        all_cand  = torch.cat(round_cands, dim=-1).to(torch.int32)  # (BH, N, R*C) int32
+        all_valid = torch.cat(round_valids, dim=-1)
         Call = all_cand.shape[-1]
 
         # ── Cross-round dedup: keep only the first occurrence of each key ─
@@ -881,14 +884,14 @@ class LSHGraphBuilder(nn.Module):
 
         CHUNK = min(Call, max(256, actual_k * 4))
         best_scores = torch.full((BH, N, actual_k), float("-inf"), device=device)
-        best_idx    = torch.zeros(BH, N, actual_k, dtype=torch.long, device=device)
+        best_idx    = torch.zeros(BH, N, actual_k, dtype=torch.int32, device=device)
 
         for start in range(0, Call, CHUNK):
             end = min(start + CHUNK, Call)
-            chunk_cand = all_cand[:, :, start:end]            # (BH, N, chunk_C)
+            chunk_cand = all_cand[:, :, start:end]            # (BH, N, chunk_C) int32
             chunk_valid = all_valid[:, :, start:end]
 
-            idx_flat = chunk_cand.reshape(BH, N * (end - start))
+            idx_flat = chunk_cand.reshape(BH, N * (end - start)).long()
             flat_idx = (idx_flat + batch_offset).reshape(-1)
             chunk_k = torch.index_select(k_flat2d, 0, flat_idx).view(
                 BH, N, end - start, d)
@@ -903,7 +906,7 @@ class LSHGraphBuilder(nn.Module):
             best_scores, merge_best = merged_scores.topk(actual_k, dim=-1)
             best_idx = torch.gather(merged_idx, -1, merge_best)
 
-        result = best_idx
+        result = best_idx.to(torch.long)
 
         # ── BUG FIX (invalid slots resolving to a duplicated real key) ───
         # When a query's true valid-candidate count is smaller than
