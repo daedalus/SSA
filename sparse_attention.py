@@ -755,6 +755,7 @@ class LSHGraphBuilder(nn.Module):
         glob_fallback: torch.Tensor,
         p_eff: int,
         num_probes: int = 0,
+        _buf: Optional[dict] = None,
     ) -> torch.Tensor:
         """One hash round, fully vectorised over BH. Returns (cand_key_idx, valid),
         each (BH, N, C*(1+num_probes_used)): candidate key indices and a boolean
@@ -768,7 +769,10 @@ class LSHGraphBuilder(nn.Module):
         point of view this is indistinguishable from having C been larger,
         it's just sourced from multiple buckets instead of one. The
         cross-round union/dedup in `forward` handles any overlap between a
-        probe bucket and another round's primary bucket for free."""
+        probe bucket and another round's primary bucket for free.
+
+        _buf: optional pre-allocated buffers dict (bstart, bsize, positions,
+        off) to avoid per-round allocation. Pass None to allocate fresh."""
         BH, N, d = q_flat.shape
         M           = k_flat.shape[1]
         device      = q_flat.device
@@ -783,14 +787,23 @@ class LSHGraphBuilder(nn.Module):
 
         sorted_k_ids, perm = torch.sort(k_ids, dim=-1)
 
-        bstart = torch.full((BH, num_buckets), M, dtype=torch.long, device=device)
-        positions = torch.arange(M, device=device).unsqueeze(0).expand(BH, M)
+        if _buf is not None:
+            bstart = _buf['bstart'].fill_(M)
+            positions = _buf['positions']
+            bsize = _buf['bsize'].zero_()
+        else:
+            bstart = torch.full((BH, num_buckets), M, dtype=torch.long, device=device)
+            positions = torch.arange(M, device=device).unsqueeze(0).expand(BH, M)
+            bsize = torch.zeros((BH, num_buckets), dtype=torch.long, device=device)
         bstart.scatter_reduce_(1, sorted_k_ids, positions, reduce='amin', include_self=True)
-
-        bsize = torch.zeros((BH, num_buckets), dtype=torch.long, device=device)
         bsize.scatter_add_(1, sorted_k_ids, torch.ones_like(sorted_k_ids))
 
         id_sets = [q_ids] + self._probe_ids(q_proj, p_eff, num_probes)
+
+        if len(id_sets) == 1:
+            return self._gather_bucket(
+                id_sets[0], bstart, bsize, perm, N, M, C, causal, glob_fallback, device,
+            )
 
         cand_list, valid_list = [], []
         for ids in id_sets:
@@ -850,11 +863,20 @@ class LSHGraphBuilder(nn.Module):
         # ── Collect candidates from every round, union them ─────────────
         # All index tensors use int32 (sequence lengths fit) to halve
         # memory vs int64 — significant at large N where index tensors
-        # dominate peak allocation.
+        # dominate peak allocation. Bucket tables (bstart, bsize) are
+        # pre-allocated once and reused across rounds to avoid per-round
+        # allocation overhead.
+        num_buckets = 2 ** p_eff
+        round_buf = {
+            'bstart': torch.full((BH, num_buckets), M, dtype=torch.long, device=device),
+            'bsize':  torch.zeros((BH, num_buckets), dtype=torch.long, device=device),
+            'positions': torch.arange(M, device=device).unsqueeze(0).expand(BH, M),
+        }
         round_cands, round_valids = [], []
         for r in range(self.R):
             cand, valid = self._single_round(q_flat, k_flat, r, top_k, causal,
-                                             glob_fallback, p_eff, self.T)
+                                             glob_fallback, p_eff, self.T,
+                                             _buf=round_buf)
             round_cands.append(cand.to(torch.int32))
             round_valids.append(valid)
 
