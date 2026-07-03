@@ -267,7 +267,35 @@ Key findings from the search:
 See the `alpha_evolve*.py` scripts (run during development, not shipped)
 for the full evolutionary search code.
 
-Memory scaling, same test suite, exact O(N²) vs O(NK) elements:
+### Memory optimization
+
+The LSH rescore step previously materialised the full `(B*H, N, R*C, d)`
+candidate-key tensor before computing dot products. With K=128, R=8, os=8,
+that's `R*C = 6784` candidates per query — at N=4096, a 6.6 GB tensor.
+Three changes reduce peak memory 7x:
+
+1. **Chunked rescore** — candidates are scored in batches of 512, keeping
+   only the running top-K. The full `(B*H, N, R*C, d)` tensor is never
+   materialised.
+2. **int32 indices** — all index tensors (`all_cand`, `sort_val`,
+   `sort_idx`, `best_idx`) use int32 instead of int64, halving their
+   memory since sequence lengths fit comfortably in 32 bits.
+3. **Pre-allocated bucket tables** — `bstart`, `bsize`, and `positions`
+   are allocated once and reused across hash rounds.
+
+```
+Peak LSH rescore memory (K=128, R=8, os=8):
+
+     N      Before      After      Saved
+-------------------------------------------
+   512      0.98 GB     0.14 GB    0.84 GB   7×
+  1024      1.97 GB     0.28 GB    1.69 GB   7×
+  2048      3.93 GB     0.56 GB    3.37 GB   7×
+  4096      7.87 GB     1.12 GB    6.75 GB   7×
+```
+
+Recall is identical before and after optimisation. Speed is
+near-identical (chunking adds ~5% overhead from the per-chunk topk merge).
 
 ```
         N      Full elems    Sparse elems     Ratio
