@@ -871,30 +871,39 @@ class LSHGraphBuilder(nn.Module):
         first_valid.scatter_(-1, sort_idx, first_valid_sorted)
         all_valid = all_valid & first_valid
 
-        # ── Exact rescore over the UNION (einsum, no (BH,N,Call,d) spike) ─
-        idx_flat = all_cand.reshape(BH, N * Call)
-        batch_offset = torch.arange(BH, device=device).unsqueeze(1) * M
-        flat_idx = (idx_flat + batch_offset).reshape(-1)
-        k_flat2d = k_flat.reshape(BH * M, d)
-        cand_k   = torch.index_select(k_flat2d, 0, flat_idx).view(BH, N, Call, d)
-
-        scores = torch.einsum('bnd,bncd->bnc', q_flat.float(), cand_k.float())
-        scores = scores.masked_fill(~all_valid, float("-inf"))
-
-        # ── top-k over the deduplicated, validity-masked union ───────────
-        # Tie-breaking note: when many candidates share the same score
-        # (most commonly -inf from masked-out overflow/empty-bucket slots,
-        # occasionally genuine ties between real dot products), torch.topk's
-        # choice among tied entries is implementation-defined. It is stable
-        # *within* a single run on a given device, but is not guaranteed to
-        # match bit-for-bit across CPU vs GPU or across different GPU
-        # architectures/cuDNN versions. This affects exact reproducibility
-        # of which masked slot gets selected — not worth working around
-        # with a manual stable-sort tiebreak unless bit-exact cross-device
-        # reproducibility is a hard requirement.
+        # ── Exact rescore over the UNION (chunked, no (BH,N,Call,d) spike) ─
+        # Process candidates in chunks to avoid materialising the full
+        # (BH, N, Call, d) cand_k tensor, which dominates peak memory at
+        # large N (e.g. 6.8 GB at N=4096 with K=128, R=8, os=8).
         actual_k = min(top_k, Call)
-        best_scores, best = scores.topk(actual_k, dim=-1)
-        result   = torch.gather(all_cand, -1, best)
+        k_flat2d = k_flat.reshape(BH * M, d)
+        batch_offset = torch.arange(BH, device=device).unsqueeze(1) * M
+
+        CHUNK = min(Call, max(256, actual_k * 4))
+        best_scores = torch.full((BH, N, actual_k), float("-inf"), device=device)
+        best_idx    = torch.zeros(BH, N, actual_k, dtype=torch.long, device=device)
+
+        for start in range(0, Call, CHUNK):
+            end = min(start + CHUNK, Call)
+            chunk_cand = all_cand[:, :, start:end]            # (BH, N, chunk_C)
+            chunk_valid = all_valid[:, :, start:end]
+
+            idx_flat = chunk_cand.reshape(BH, N * (end - start))
+            flat_idx = (idx_flat + batch_offset).reshape(-1)
+            chunk_k = torch.index_select(k_flat2d, 0, flat_idx).view(
+                BH, N, end - start, d)
+
+            chunk_scores = torch.einsum(
+                'bnd,bncd->bnc', q_flat.float(), chunk_k.float())
+            chunk_scores = chunk_scores.masked_fill(~chunk_valid, float("-inf"))
+
+            # Merge with running best via topk on concatenated scores
+            merged_scores = torch.cat([best_scores, chunk_scores], dim=-1)
+            merged_idx    = torch.cat([best_idx, chunk_cand], dim=-1)
+            best_scores, merge_best = merged_scores.topk(actual_k, dim=-1)
+            best_idx = torch.gather(merged_idx, -1, merge_best)
+
+        result = best_idx
 
         # ── BUG FIX (invalid slots resolving to a duplicated real key) ───
         # When a query's true valid-candidate count is smaller than
