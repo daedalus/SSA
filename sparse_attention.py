@@ -1,13 +1,6 @@
 """
-Conditionally Sub-Quadratic Sparse Attention (SSA) — v9
+Sub-Quadratic Sparse Attention (SSA)
 =========================================================
-
-NAME CHANGE FROM v7/v8 ("True Sub-Quadratic"): the previous title claimed
-an unconditional guarantee the implementation does not provide. The
-class is still named `SparseAttention` for backward compatibility
-(it genuinely never materializes an N×N tensor — that part of "true" is
-accurate), but the asymptotic complexity claim is conditional, not
-absolute:
 
   Sub-quadratic in N HOLDS IF AND ONLY IF K, R, C are held fixed
   (i.e. independent of N) as N grows. If a caller scales K, R, or C
